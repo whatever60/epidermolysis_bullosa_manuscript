@@ -68,6 +68,10 @@ metagenomics_20260206/analysis_update/halla_output/
 metagenomics_20260206/analysis_update/maaslin2/
 metagenomics_20260206/analysis_update/lefse/
 
+# analysis_update generated artifacts (regenerable)
+metagenomics_20260206/analysis_update/figures/
+metagenomics_20260206/analysis_update/tables/
+
 # -----------------------------
 # Logs / transient files
 # -----------------------------

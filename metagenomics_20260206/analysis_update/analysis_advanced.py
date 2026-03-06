@@ -19,16 +19,13 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     import analysis_base as base
 
 
+HOST_MODEL_NAME = "host_model"
 HOST_FORMULAS = {
-    "host_base": (
-        "host_logit ~ C(body_region, Treatment('lower_extremity')) "
-        "+ C(culture_positive_label, Treatment('negative')) + years_since_first_sample"
-    ),
-    "host_extended": (
+    HOST_MODEL_NAME: (
         "host_logit ~ C(body_region, Treatment('lower_extremity')) "
         "+ C(chronicity_group, Treatment('unknown')) "
         "+ C(culture_positive_label, Treatment('negative')) + years_since_first_sample"
-    ),
+    )
 }
 
 SPECIES_FORMULA = (
@@ -60,6 +57,14 @@ def ensure_dirs(context: AdvancedContext) -> None:
     context.figure_dir.mkdir(exist_ok=True)
     context.table_dir.mkdir(exist_ok=True)
     context.input_dir.mkdir(exist_ok=True)
+
+
+def save_svg_and_jpg(fig: plt.Figure, svg_path: Path, **kwargs) -> None:
+    svg_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(svg_path, bbox_inches="tight", **kwargs)
+    jpg_kwargs = dict(kwargs)
+    jpg_kwargs.pop("format", None)
+    fig.savefig(svg_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300, **jpg_kwargs)
 
 
 def prepare_base_data(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -396,7 +401,7 @@ def make_host_comparison_figure(
     host_cluster: pd.DataFrame,
     context: AdvancedContext,
 ) -> None:
-    mixed = host_mixed.loc[host_mixed["model_name"] == "host_base"].copy()
+    mixed = host_mixed.loc[host_mixed["model_name"] == HOST_MODEL_NAME].copy()
     cluster = host_cluster.copy()
     data = mixed.merge(
         cluster[["term", "estimate"]].rename(columns={"estimate": "estimate_cluster"}),
@@ -427,7 +432,7 @@ def make_host_comparison_figure(
     ax.set_title("Host model: cluster-robust versus mixed-effects estimates")
     ax.legend(frameon=False, loc="lower right")
     fig.tight_layout()
-    fig.savefig(context.figure_dir / "advanced_figure_01_host_compare.svg", bbox_inches="tight")
+    save_svg_and_jpg(fig, context.figure_dir / "advanced_figure_01_host_compare.svg")
     plt.close(fig)
 
 
@@ -463,7 +468,7 @@ def make_species_mixed_figure(species_mixed: pd.DataFrame, context: AdvancedCont
     ax.set_ylabel("")
     ax.set_title("Selected variance-component mixed-model associations")
     fig.tight_layout()
-    fig.savefig(context.figure_dir / "advanced_figure_02_species_mixed.svg", bbox_inches="tight")
+    save_svg_and_jpg(fig, context.figure_dir / "advanced_figure_02_species_mixed.svg")
     plt.close(fig)
     return plot_df
 
@@ -478,10 +483,8 @@ def write_report(
     comparison: pd.DataFrame,
     species_plot_df: pd.DataFrame,
 ) -> None:
-    host_base = host_effects.loc[host_effects["model_name"] == "host_base"].copy()
-    host_best = host_base.loc[host_base["term"] != "Intercept"].sort_values("pvalue").head(1)
-    host_ext = host_effects.loc[host_effects["model_name"] == "host_extended"].copy()
-    host_ext_best = host_ext.loc[host_ext["term"].str.contains("chronicity_group")].sort_values("pvalue").head(1)
+    host_model = host_effects.loc[host_effects["model_name"] == HOST_MODEL_NAME].copy()
+    host_best = host_model.loc[host_model["term"] != "Intercept"].sort_values("pvalue").head(1)
     species_hits = species_effects.sort_values("qvalue").head(6)
     mixed_status = species_status.loc[:, ["outcome", "aic", "patient_var", "batch_var", "warning_count"]]
     agree = comparison["same_direction"].dropna().mean()
@@ -499,25 +502,20 @@ def write_report(
         "",
     ]
 
-    if (host_base["qvalue"] <= 0.1).any() and not host_best.empty:
+    if (host_model["qvalue"] <= 0.1).any() and not host_best.empty:
         row = host_best.iloc[0]
         lines.append(
-            f"- Base host mixed model: strongest non-intercept term was `{base.prettify_model_term(row['term'])}` with estimate {row['estimate']:.2f} (q={row['qvalue']:.3g})."
+            f"- Host mixed model: strongest non-intercept term was `{base.prettify_model_term(row['term'])}` with estimate {row['estimate']:.2f} (q={row['qvalue']:.3g})."
         )
     elif not host_best.empty:
         row = host_best.iloc[0]
         lines.append(
-            f"- Base host mixed model: no fixed-effect term reached q <= 0.1; the largest signal was `{base.prettify_model_term(row['term'])}` with estimate {row['estimate']:.2f} (q={row['qvalue']:.3g})."
-        )
-    if not host_ext_best.empty:
-        row = host_ext_best.iloc[0]
-        lines.append(
-            f"- Extended host mixed model: chronicity signal `{base.prettify_model_term(row['term'])}` had estimate {row['estimate']:.2f} (q={row['qvalue']:.3g})."
+            f"- Host mixed model: no fixed-effect term reached q <= 0.1; the largest signal was `{base.prettify_model_term(row['term'])}` with estimate {row['estimate']:.2f} (q={row['qvalue']:.3g})."
         )
 
-    host_status_row = host_status.loc[host_status["model_name"] == "host_base"].iloc[0]
+    host_status_row = host_status.loc[host_status["model_name"] == HOST_MODEL_NAME].iloc[0]
     lines.append(
-        f"- Host base model variance components: patient {host_status_row['patient_var']:.3g}, batch {host_status_row['batch_var']:.3g}."
+        f"- Host model variance components: patient {host_status_row['patient_var']:.3g}, batch {host_status_row['batch_var']:.3g}."
     )
 
     lines.extend(["", "## Species models", ""])

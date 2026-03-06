@@ -61,7 +61,8 @@ table_id_map <- c(
   `21` = "08_02", `22` = "08_03", `23` = "09_01", `24` = "09_02", `25` = "10_01",
   `26` = "10_02", `27` = "11_01", `28` = "11_02", `29` = "12_01", `30` = "12_02",
   `31` = "12_03", `32` = "13_01", `33` = "13_02", `34` = "13_03", `35` = "13_04",
-  `36` = "14_01", `37` = "14_02", `38` = "12_04"
+  `36` = "14_01", `37` = "14_02", `38` = "12_04", `39` = "12_05", `40` = "12_06",
+  `41` = "12_07", `42` = "13_05", `43` = "13_06"
 )
 
 figure_id_map <- c(
@@ -69,7 +70,7 @@ figure_id_map <- c(
   `6` = "06_02", `7` = "07_01", `8` = "08_01", `9` = "09_01", `10` = "10_01",
   `11` = "11_01", `12` = "12_01", `13` = "12_02", `14` = "13_01", `15` = "13_02",
   `16` = "13_03", `17` = "13_04", `18` = "14_01", `19` = "14_02", `20` = "14_03",
-  `21` = "14_04", `22` = "12_03"
+  `21` = "14_04", `22` = "12_03", `23` = "12_04", `24` = "12_05"
 )
 
 table_file <- function(number, slug) {
@@ -317,7 +318,6 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     analysis_context = wc.base_analysis_context(context)
                     qc = base_data["qc"].copy()
                     host_fit, host_table = base.fit_host_model(qc)
-                    base.make_qc_figure(qc, analysis_context)
 
                     qc_table = qc.reset_index().rename(columns={"index": "sample_id"})
                     wc.save_table(qc_table, wc.table_path(context, 2, "qc_metrics"))
@@ -334,7 +334,6 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     qc_table = pd.read_csv(wc.table_path(context, 2, "qc_metrics"), sep="\\t")
                     host_table = pd.read_csv(wc.table_path(context, 3, "host_model"), sep="\\t")
 
-                    display(SVG(filename=str(wc.figure_path(context, 1, "qc_host_burden"))))
                     display(qc_table[
                         [
                             "sample_id",
@@ -386,7 +385,78 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     community_samples = qc.index[qc["community_qc_pass"]].tolist()
                     rel_abundance = base.community_relative_abundance(species_bac, community_samples)
                     pairwise = base.summarize_pairwise_distances(rel_abundance, metadata)
-                    summary = base.make_distance_figure(pairwise, analysis_context)
+
+                    from scipy.stats import mannwhitneyu
+                    import matplotlib.pyplot as plt
+                    import seaborn as sns
+
+                    order = [
+                        "Same patient, same batch date",
+                        "Same patient, different batch date",
+                        "Different patient",
+                    ]
+                    summary = (
+                        pairwise.groupby("comparison_group")["distance"]
+                        .agg(["count", "median", "mean"])
+                        .reindex(order)
+                        .reset_index()
+                    )
+
+                    pvalue_rows = []
+                    reference = pairwise.loc[pairwise["comparison_group"] == "Different patient", "distance"]
+                    for group in order[:-1]:
+                        test = pairwise.loc[pairwise["comparison_group"] == group, "distance"]
+                        statistic = mannwhitneyu(test, reference, alternative="less")
+                        pvalue_rows.append(
+                            {
+                                "comparison_group": group,
+                                "reference_group": "Different patient",
+                                "pvalue": statistic.pvalue,
+                                "median_difference": test.median() - reference.median(),
+                            }
+                        )
+                    pvalues = base.bh_adjust(pd.DataFrame(pvalue_rows), "pvalue")
+
+                    fig, ax = plt.subplots(figsize=(8.5, 5))
+                    sns.boxplot(
+                        data=pairwise,
+                        x="comparison_group",
+                        y="distance",
+                        order=order,
+                        color="#dfe7d6",
+                        fliersize=0,
+                        width=0.6,
+                        ax=ax,
+                    )
+                    sns.stripplot(
+                        data=pairwise.sample(min(pairwise.shape[0], 4000), random_state=7),
+                        x="comparison_group",
+                        y="distance",
+                        order=order,
+                        color="#3f4d3c",
+                        alpha=0.25,
+                        size=3,
+                        ax=ax,
+                    )
+                    ax.set_xlabel("")
+                    ax.set_ylabel("Bray-Curtis distance")
+                    ax.set_title("Descriptive Bray-Curtis similarity by patient and batch-date grouping")
+                    ax.set_xticks(range(len(order)), order, rotation=15, ha="right")
+                    for idx, row in pvalues.iterrows():
+                        ax.text(
+                            idx,
+                            0.98,
+                            f"q={row['qvalue']:.3g}",
+                            ha="center",
+                            va="top",
+                            fontsize=9,
+                        )
+                    fig.tight_layout()
+                    fig_path = wc.figure_path(context, 2, "pairwise_distance")
+                    fig.savefig(fig_path, bbox_inches="tight")
+                    fig.savefig(fig_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
+                    plt.close(fig)
+                    summary = summary.merge(pvalues, on="comparison_group", how="left")
 
                     wc.save_table(pairwise, wc.table_path(context, 4, "pairwise_distances"))
                     wc.save_table(summary, wc.table_path(context, 5, "pairwise_distance_summary"))
@@ -442,7 +512,51 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     species_bac = base_data["species_bac"]
 
                     culture_summary, culture_plot_df = base.make_culture_abundance_table(qc, species_bac)
-                    base.make_culture_figure(culture_summary, culture_plot_df, analysis_context)
+
+                    import matplotlib.pyplot as plt
+                    import seaborn as sns
+                    import numpy as np
+
+                    top_labels = culture_summary.head(6)["label"].tolist()
+                    culture_plot_df = culture_plot_df.loc[culture_plot_df["label"].isin(top_labels)].copy()
+                    culture_plot_df["culture_status"] = np.where(culture_plot_df["culture_positive"], "Culture positive", "Culture negative")
+                    culture_plot_df["log10_relative_abundance"] = np.log10(culture_plot_df["relative_abundance"] + 1e-6)
+
+                    fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharey=True)
+                    axes = axes.ravel()
+                    for ax, label in zip(axes, top_labels):
+                        data = culture_plot_df.loc[culture_plot_df["label"] == label]
+                        sns.boxplot(
+                            data=data,
+                            x="culture_status",
+                            y="log10_relative_abundance",
+                            color="#f2d4b7",
+                            width=0.6,
+                            fliersize=0,
+                            ax=ax,
+                        )
+                        sns.stripplot(
+                            data=data,
+                            x="culture_status",
+                            y="log10_relative_abundance",
+                            color="#5b3417",
+                            alpha=0.5,
+                            size=4,
+                            ax=ax,
+                        )
+                        metrics = culture_summary.loc[culture_summary["label"] == label].iloc[0]
+                        ax.set_title(f"{label}\\nU-test q={metrics['qvalue']:.3g}; AUROC={metrics['auroc']:.2f}")
+                        ax.set_xlabel("")
+                        ax.set_ylabel("log10(relative abundance + 1e-6)")
+                        ax.tick_params(axis="x", rotation=20)
+                    for ax in axes[len(top_labels):]:
+                        ax.axis("off")
+                    fig.tight_layout()
+                    fig_path = wc.figure_path(context, 3, "culture_concordance")
+                    fig.savefig(fig_path, bbox_inches="tight")
+                    fig.savefig(fig_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
+                    plt.close(fig)
+
                     wc.save_table(culture_summary, wc.table_path(context, 6, "culture_concordance"))
                     """
                 ),
@@ -493,7 +607,49 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     species_bac = base_data["species_bac"]
 
                     species_results = base.fit_species_models(qc, species_bac)
-                    base.make_species_association_figure(species_results, analysis_context)
+
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+
+                    if not species_results.empty:
+                        plot_df = species_results.loc[
+                            species_results["term"].str.contains("body_region") | species_results["term"].str.contains("chronicity_group")
+                        ].copy()
+                        plot_df = plot_df.loc[plot_df["qvalue"].fillna(1) <= 0.15].copy()
+                        if plot_df.empty:
+                            plot_df = species_results.loc[
+                                species_results["term"].str.contains("body_region") | species_results["term"].str.contains("chronicity_group")
+                            ].head(12).copy()
+                        plot_df["term_label"] = plot_df["term"].map(base.prettify_model_term)
+                        plot_df["species_label"] = plot_df["species"]
+                        plot_df = plot_df.sort_values(["estimate", "species_label"])
+                        plot_df["y_label"] = plot_df["species_label"] + " | " + plot_df["term_label"]
+
+                        fig, ax = plt.subplots(figsize=(10, max(4.5, 0.45 * plot_df.shape[0])))
+                        ax.axvline(0, color="black", linewidth=1, linestyle="--")
+                        ax.errorbar(
+                            x=plot_df["estimate"],
+                            y=np.arange(plot_df.shape[0]),
+                            xerr=[
+                                plot_df["estimate"] - plot_df["conf_low"],
+                                plot_df["conf_high"] - plot_df["estimate"],
+                            ],
+                            fmt="o",
+                            color="#204a87",
+                            ecolor="#7aa6d8",
+                            capsize=3,
+                        )
+                        ax.set_yticks(np.arange(plot_df.shape[0]))
+                        ax.set_yticklabels(plot_df["y_label"])
+                        ax.set_xlabel("Cluster-robust CLR effect size")
+                        ax.set_ylabel("")
+                        ax.set_title("Body region and chronicity associations for key taxa")
+                        fig.tight_layout()
+                        fig_path = wc.figure_path(context, 4, "species_associations")
+                        fig.savefig(fig_path, bbox_inches="tight")
+                        fig.savefig(fig_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
+                        plt.close(fig)
+
                     wc.save_table(species_results, wc.table_path(context, 7, "species_associations"))
                     """
                 ),
@@ -600,8 +756,88 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                         }
 
 
-                    def fit_patient_structure_diagnostics(qc, species_bac):
+                    def collect_optimizer_attempts(
+                        data,
+                        formula,
+                        outcome,
+                        structure_name,
+                        group_col,
+                        vc_formula=None,
+                        constant_group=False,
+                    ):
+                        frame = data.copy()
+                        if constant_group:
+                            frame[group_col] = "all"
+
                         rows = []
+                        candidates = []
+                        for method in ["lbfgs", "powell", "bfgs"]:
+                            try:
+                                with warnings.catch_warnings(record=True) as caught:
+                                    warnings.simplefilter("always")
+                                    fit = smf.mixedlm(
+                                        formula=formula,
+                                        data=frame,
+                                        groups=frame[group_col],
+                                        vc_formula=vc_formula,
+                                    ).fit(reml=False, method=method, maxiter=500, disp=False)
+                                warning_messages = [str(item.message) for item in caught]
+                                row = {
+                                    "outcome": outcome,
+                                    "model_name": advanced.HOST_MODEL_NAME,
+                                    "structure": structure_name,
+                                    "optimizer": method,
+                                    "status": "ok",
+                                    "converged": bool(getattr(fit, "converged", False)),
+                                    "aic": float(fit.aic),
+                                    "bic": float(fit.bic),
+                                    "llf": float(fit.llf),
+                                    "patient_var": float(fit.params.get("patient Var", np.nan)) if vc_formula is not None else (float(fit.params.get("Group Var", np.nan)) if structure_name == "patient_only" else np.nan),
+                                    "batch_var": float(fit.params.get("batch Var", np.nan)) if vc_formula is not None else (float(fit.params.get("Group Var", np.nan)) if structure_name == "batch_only" else np.nan),
+                                    "warning_count": len(warning_messages),
+                                    "warnings": " | ".join(sorted(set(warning_messages)))[:2000],
+                                    "error": "",
+                                    "selected": False,
+                                }
+                                rows.append(row)
+                                candidates.append((fit, warning_messages, method))
+                            except Exception as exc:
+                                rows.append(
+                                    {
+                                        "outcome": outcome,
+                                        "model_name": advanced.HOST_MODEL_NAME,
+                                        "structure": structure_name,
+                                        "optimizer": method,
+                                        "status": "failed",
+                                        "converged": False,
+                                        "aic": np.nan,
+                                        "bic": np.nan,
+                                        "llf": np.nan,
+                                        "patient_var": np.nan,
+                                        "batch_var": np.nan,
+                                        "warning_count": 0,
+                                        "warnings": "",
+                                        "error": repr(exc),
+                                        "selected": False,
+                                    }
+                                )
+
+                        if candidates:
+                            selected_fit, _, selected_optimizer = _best_mixed_fit(candidates)
+                            selected_aic = float(selected_fit.aic)
+                            for row in rows:
+                                if (
+                                    row["status"] == "ok"
+                                    and row["optimizer"] == selected_optimizer
+                                    and np.isfinite(row["aic"])
+                                    and abs(float(row["aic"]) - selected_aic) < 1e-8
+                                ):
+                                    row["selected"] = True
+                                    break
+                        return rows
+
+
+                    def fit_patient_structure_diagnostics(qc):
                         host_df = qc.dropna(
                             subset=[
                                 "host_logit",
@@ -613,68 +849,37 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                                 "years_since_first_sample",
                             ]
                         ).copy()
-                        host_formula = advanced.HOST_FORMULAS["host_base"]
-                        rows.append(fit_single_group_model(host_df, host_formula, "host_logit", "patient_only", "patient_id"))
-                        rows.append(fit_single_group_model(host_df, host_formula, "host_logit", "batch_only", "batch_id"))
-                        _, host_status = advanced.fit_variance_component_model(host_df, host_formula, "host_logit", "host_base")
-                        rows.append(
-                            {
-                                "outcome": "host_logit",
-                                "structure": "patient_plus_batch",
-                                "status": "ok",
-                                "converged": host_status["converged"],
-                                "aic": host_status["aic"],
-                                "optimizer": host_status["optimizer"],
-                                "patient_var": host_status["patient_var"],
-                                "batch_var": host_status["batch_var"],
-                                "warning_count": host_status["warning_count"],
-                                "warnings": host_status["warnings"],
-                                "error": "",
-                            }
-                        )
-
-                        sample_ids = qc.index[qc["model_qc_pass"]].tolist()
-                        counts = species_bac.loc[sample_ids].copy()
-                        clr = base.clr_transform(counts)
-                        model_df = qc.loc[
-                            sample_ids,
-                            [
+                        host_formula = advanced.HOST_FORMULAS[advanced.HOST_MODEL_NAME]
+                        rows = []
+                        rows.extend(
+                            collect_optimizer_attempts(
+                                host_df,
+                                host_formula,
+                                "host_logit",
+                                "patient_only",
                                 "patient_id",
+                            )
+                        )
+                        rows.extend(
+                            collect_optimizer_attempts(
+                                host_df,
+                                host_formula,
+                                "host_logit",
+                                "batch_only",
                                 "batch_id",
-                                "body_region",
-                                "chronicity_group",
-                                "log10_bacterial_reads",
-                                "years_since_first_sample",
-                            ],
-                        ].copy()
-                        for species in ["Pseudomonas aeruginosa", "Staphylococcus aureus"]:
-                            if species not in clr.columns:
-                                continue
-                            frame = model_df.copy()
-                            frame["response"] = clr[species]
-                            rows.append(fit_single_group_model(frame, advanced.SPECIES_FORMULA, species, "patient_only", "patient_id"))
-                            rows.append(fit_single_group_model(frame, advanced.SPECIES_FORMULA, species, "batch_only", "batch_id"))
-                            _, status = advanced.fit_variance_component_model(
-                                frame,
-                                advanced.SPECIES_FORMULA,
-                                species,
-                                "species_mixedlm",
                             )
-                            rows.append(
-                                {
-                                    "outcome": species,
-                                    "structure": "patient_plus_batch",
-                                    "status": "ok",
-                                    "converged": status["converged"],
-                                    "aic": status["aic"],
-                                    "optimizer": status["optimizer"],
-                                    "patient_var": status["patient_var"],
-                                    "batch_var": status["batch_var"],
-                                    "warning_count": status["warning_count"],
-                                    "warnings": status["warnings"],
-                                    "error": "",
-                                }
+                        )
+                        rows.extend(
+                            collect_optimizer_attempts(
+                                host_df,
+                                host_formula,
+                                "host_logit",
+                                "patient_plus_batch",
+                                "all_group",
+                                vc_formula={"patient": "0 + C(patient_id)", "batch": "0 + C(batch_id)"},
+                                constant_group=True,
                             )
+                        )
                         return pd.DataFrame(rows)
 
 
@@ -853,7 +1058,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     qc = base_data["qc"].copy()
                     species_bac = base_data["species_bac"]
 
-                    diagnostics = fit_patient_structure_diagnostics(qc, species_bac)
+                    diagnostics = fit_patient_structure_diagnostics(qc)
                     host_cluster_fit, host_cluster = base.fit_host_model(qc)
                     species_cluster = base.fit_species_models(qc, species_bac)
 
@@ -885,13 +1090,21 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     advanced.make_species_mixed_figure(species_effects, advanced_context)
 
                     host_source = context.figure_dir / "advanced_figure_01_host_compare.svg"
+                    host_source_jpg = context.figure_dir / "advanced_figure_01_host_compare.jpg"
                     species_source = context.figure_dir / "advanced_figure_02_species_mixed.svg"
+                    species_source_jpg = context.figure_dir / "advanced_figure_02_species_mixed.jpg"
                     host_dest = wc.figure_path(context, 5, "host_model_compare")
+                    host_dest_jpg = host_dest.with_suffix(".jpg")
                     species_dest = wc.figure_path(context, 6, "species_mixed_effects")
+                    species_dest_jpg = species_dest.with_suffix(".jpg")
                     if host_source.exists():
                         shutil.move(host_source, host_dest)
+                    if host_source_jpg.exists():
+                        shutil.move(host_source_jpg, host_dest_jpg)
                     if species_source.exists():
                         shutil.move(species_source, species_dest)
+                    if species_source_jpg.exists():
+                        shutil.move(species_source_jpg, species_dest_jpg)
 
                     wc.save_table(diagnostics, wc.table_path(context, 8, "patient_structure_diagnostics"))
                     wc.save_table(host_effects, wc.table_path(context, 9, "host_mixed_effects"))
@@ -922,26 +1135,26 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     display(SVG(filename=str(wc.figure_path(context, 6, "species_mixed_effects"))))
                     display(species_effects.head(20))
 
-                    host_base = host_status.loc[
+                    host_model = host_status.loc[
                         (host_status["record_type"] == "model_fit")
-                        & (host_status["model_name"] == "host_base")
+                        & (host_status["model_name"] == advanced.HOST_MODEL_NAME)
                     ].iloc[0]
-                    host_base_tests = host_status.loc[
+                    host_model_tests = host_status.loc[
                         (host_status["record_type"] == "random_effect_test")
-                        & (host_status["model_name"] == "host_base")
+                        & (host_status["model_name"] == advanced.HOST_MODEL_NAME)
                     ].copy()
                     sign_agree = comparison["same_direction"].dropna().mean()
-                    patient_test = host_base_tests.loc[
-                        host_base_tests["tested_effect"] == "patient_only_vs_fixed"
+                    patient_test = host_model_tests.loc[
+                        host_model_tests["tested_effect"] == "patient_only_vs_fixed"
                     ].iloc[0]
-                    batch_test = host_base_tests.loc[
-                        host_base_tests["tested_effect"] == "batch_only_vs_fixed"
+                    batch_test = host_model_tests.loc[
+                        host_model_tests["tested_effect"] == "batch_only_vs_fixed"
                     ].iloc[0]
-                    add_batch_test = host_base_tests.loc[
-                        host_base_tests["tested_effect"] == "batch_added_to_patient"
+                    add_batch_test = host_model_tests.loc[
+                        host_model_tests["tested_effect"] == "batch_added_to_patient"
                     ].iloc[0]
                     summary_lines = [
-                        f"- Patient-plus-batch host model AIC: {host_base['aic']:.2f}; patient variance {host_base['patient_var']:.3g}, batch variance {host_base['batch_var']:.3g}.",
+                        f"- Patient-plus-batch host model AIC: {host_model['aic']:.2f}; patient variance {host_model['patient_var']:.3g}, batch variance {host_model['batch_var']:.3g}.",
                         f"- Gaussian random-effect tests: patient vs fixed p={patient_test['pvalue_boundary']:.3g}, batch vs fixed p={batch_test['pvalue_boundary']:.3g}, add batch on top of patient p={add_batch_test['pvalue_boundary']:.3g}.",
                         f"- Positive result: sign agreement between simple and mixed models was {sign_agree:.1%} across matched terms.",
                         "- Positive result: P. aeruginosa chronic-like enrichment and S. aureus head/neck enrichment persisted in the mixed model.",
@@ -1971,8 +2184,9 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     # 11. Host Fraction Beta-Binomial Mixed Model
 
                     This notebook upgrades the earlier host-fraction regression to a count-based mixed model.
-                    The response is modeled as host read pairs out of trimmed read pairs, so total sequencing depth is handled
-                    through the binomial denominator rather than added again as a separate nuisance covariate.
+                    The response is modeled as Bracken human species reads out of Bracken root reads
+                    from the pre-host-filter reports,
+                    so library-size scaling is handled through the binomial denominator rather than added again as a separate nuisance covariate.
                     Absolute culture date is treated as technical batch, while patient-relative elapsed time is treated as biology.
                     """
                 ),
@@ -1999,7 +2213,8 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     qc <- read_tsv(table_file(2, "qc_metrics"), show_col_types = FALSE) |>
                       mutate(
                         culture_date = as.Date(culture_date),
-                        host_pairs = pmax(trimmed_pairs - non_host_pairs, 0),
+                        human_reads = pmax(human_species_reads, 0),
+                        non_human_reads = pmax(bracken_total_reads - human_species_reads, 0),
                         culture_positive = factor(if_else(as.logical(culture_positive), "positive", "negative"),
                                                   levels = c("negative", "positive")),
                         patient_id = factor(sprintf("%02d", as.integer(patient_id))),
@@ -2012,9 +2227,9 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                                                    levels = c("other", "acute_like"))
                       ) |>
                       filter(
-                        !is.na(host_pairs),
-                        !is.na(non_host_pairs),
-                        trimmed_pairs > 0,
+                        !is.na(human_reads),
+                        !is.na(non_human_reads),
+                        bracken_total_reads > 0,
                         !is.na(body_region),
                         !is.na(chronicity_group),
                         !is.na(culture_positive),
@@ -2022,13 +2237,13 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                         !is.na(batch_id)
                       )
 
-                    host_model_formula <- "cbind(host_pairs, non_host_pairs) ~ body_region + chronicity_group + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)"
+                    host_model_formula <- "cbind(human_reads, non_human_reads) ~ body_region + chronicity_group + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)"
 
                     host_input_summary <- tibble(
                       n_samples = nrow(qc),
                       n_patients = n_distinct(qc$patient_id),
                       n_batches = n_distinct(qc$batch_id),
-                      response = "cbind(host_pairs, non_host_pairs)",
+                      response = "cbind(human_reads, non_human_reads)",
                       fixed_effects = "body_region + chronicity_group + culture_positive + years_since_first_sample",
                       random_effects = "(1 | patient_id) + (1 | batch_id)",
                       family = "betabinomial(link = 'logit')"
@@ -2101,12 +2316,12 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                       list(fit = fit, status = status)
                     }
 
-                    full_fixed_formula <- "cbind(host_pairs, non_host_pairs) ~ body_region + chronicity_group + culture_positive + years_since_first_sample"
+                    full_fixed_formula <- "cbind(human_reads, non_human_reads) ~ body_region + chronicity_group + culture_positive + years_since_first_sample"
                     full_random_formula <- paste(full_fixed_formula, "+ (1 | patient_id) + (1 | batch_id)")
                     patient_only_formula <- paste(full_fixed_formula, "+ (1 | patient_id)")
                     batch_only_formula <- paste(full_fixed_formula, "+ (1 | batch_id)")
-                    no_body_region_formula <- "cbind(host_pairs, non_host_pairs) ~ chronicity_group + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)"
-                    no_chronicity_formula <- "cbind(host_pairs, non_host_pairs) ~ body_region + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)"
+                    no_body_region_formula <- "cbind(human_reads, non_human_reads) ~ chronicity_group + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)"
+                    no_chronicity_formula <- "cbind(human_reads, non_human_reads) ~ body_region + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)"
 
                     candidate_results <- list(
                       fit_host_candidate("fixed_only", full_fixed_formula),
@@ -2138,11 +2353,11 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     contrast_specs <- tribble(
                       ~model_name, ~formula_text, ~target_term, ~term_label,
                       "upper_extremity_contrast",
-                      "cbind(host_pairs, non_host_pairs) ~ upper_extremity_binary + chronicity_group + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)",
+                      "cbind(human_reads, non_human_reads) ~ upper_extremity_binary + chronicity_group + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)",
                       "upper_extremity_binaryupper_extremity",
                       "Planned contrast: upper extremity vs all other body regions",
                       "acute_like_contrast",
-                      "cbind(host_pairs, non_host_pairs) ~ body_region + acute_like_binary + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)",
+                      "cbind(human_reads, non_human_reads) ~ body_region + acute_like_binary + culture_positive + years_since_first_sample + (1 | patient_id) + (1 | batch_id)",
                       "acute_like_binaryacute_like",
                       "Planned contrast: acute-like vs all other chronicity groups"
                     )
@@ -2455,11 +2670,11 @@ def build_notebooks(output_dir: Path) -> list[Path]:
             ],
         ),
         (
-            "12_adjusted_community_structure.ipynb",
+            "12_adjusted_community_structure_analysis.ipynb",
             [
                 md(
                     """
-                    # 12. Adjusted Community Structure Models
+                    # 12. Adjusted Community Structure Analysis (R)
 
                     This notebook revisits community similarity with multivariable models.
                     It combines a patient-aware PERMANOVA for overall community structure with pairwise mixed models
@@ -2668,7 +2883,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                         )
                     }
 
-                    pairwise_effects <- bind_rows(
+                    pairwise_effects_all <- bind_rows(
                       extract_pairwise_effects(pair_model_body_region, "body_region_model"),
                       extract_pairwise_effects(pair_model_exact_location, "exact_location_model")
                     ) |>
@@ -2676,7 +2891,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                       mutate(qvalue = p.adjust(p.value, method = "BH")) |>
                       ungroup()
 
-                    pairwise_status <- tibble(
+                    pairwise_status_all <- tibble(
                       model = c("body_region_model", "exact_location_model"),
                       n_pairs = nrow(pair_df),
                       aic = c(AIC(pair_model_body_region), AIC(pair_model_exact_location)),
@@ -2685,8 +2900,15 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                       singular = c(isSingular(pair_model_body_region), isSingular(pair_model_exact_location))
                     )
 
+                    pairwise_effects <- pairwise_effects_all |> filter(model == "body_region_model")
+                    pairwise_effects_exact <- pairwise_effects_all |> filter(model == "exact_location_model")
+                    pairwise_status <- pairwise_status_all |> filter(model == "body_region_model")
+                    pairwise_status_exact <- pairwise_status_all |> filter(model == "exact_location_model")
+
                     write_tsv(pairwise_effects, table_file(30, "pairwise_similarity_mixed_effects"))
                     write_tsv(pairwise_status, table_file(31, "pairwise_similarity_model_status"))
+                    write_tsv(pairwise_effects_exact, table_file(39, "pairwise_similarity_mixed_effects_exact_location_sensitivity"))
+                    write_tsv(pairwise_status_exact, table_file(40, "pairwise_similarity_model_status_exact_location_sensitivity"))
 
                     print(pairwise_effects)
                     print(pairwise_status)
@@ -2749,7 +2971,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                         )
                     }
 
-                    adjusted_margins <- bind_rows(lapply(seq_len(nrow(margin_specs)), function(i) {
+                    adjusted_margins_all <- bind_rows(lapply(seq_len(nrow(margin_specs)), function(i) {
                       make_margin_table(
                         model_lookup[[margin_specs$model_key[[i]]]],
                         margin_specs$focal_term[[i]],
@@ -2758,132 +2980,338 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                       )
                     }))
 
+                    adjusted_margins <- adjusted_margins_all |> filter(model == "body_region_model")
+                    adjusted_margins_exact <- adjusted_margins_all |> filter(model == "exact_location_model")
                     write_tsv(adjusted_margins, table_file(38, "pairwise_adjusted_margins"))
+                    write_tsv(adjusted_margins_exact, table_file(41, "pairwise_adjusted_margins_exact_location_sensitivity"))
                     print(adjusted_margins)
                     """
                 ),
                 md(
                     """
-                    ## Summarize Positive And Negative Results
+                    ## Review Numbered Table Outputs
                     """
                 ),
                 code(
                     """
-                    permanova_plot_df <- permanova_table |>
-                      filter(!term %in% c("Residual", "Total")) |>
-                      mutate(term_label = factor(term_label, levels = term_label[order(r2)]))
-
-                    figure_12 <- ggplot(permanova_plot_df, aes(x = r2, y = term_label, fill = qvalue <= 0.1)) +
-                      geom_col(width = 0.7) +
-                      scale_fill_manual(values = c("TRUE" = "#b22222", "FALSE" = "#3b6a8f"), na.value = "#3b6a8f") +
-                      labs(
-                        title = "Adjusted PERMANOVA on Bray-Curtis community structure",
-                        x = "Marginal R2",
-                        y = NULL,
-                        fill = "q <= 0.1"
-                      ) +
-                      theme(legend.position = "top")
-
-                    ggsave(
-                      figure_file(12, "adjusted_permanova"),
-                      figure_12,
-                      width = 11,
-                      height = 7.5,
-                      device = grDevices::svg
-                    )
-                    print(figure_12)
-
-                    pair_plot_df <- pairwise_effects |>
-                      mutate(
-                        term_label = factor(term_label, levels = rev(unique(term_label))),
-                        model = factor(model, levels = c("body_region_model", "exact_location_model"),
-                                       labels = c("Body-region model", "Exact-location model")),
-                        significant = qvalue <= 0.1
-                      )
-
-                    figure_13 <- ggplot(pair_plot_df, aes(x = estimate, y = term_label, color = significant)) +
-                      geom_vline(xintercept = 0, linewidth = 0.5, linetype = "dashed", color = "grey50") +
-                      geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.18, linewidth = 0.7) +
-                      geom_point(size = 2.4) +
-                      facet_wrap(~model) +
-                      scale_color_manual(values = c("TRUE" = "#b22222", "FALSE" = "#3b6a8f")) +
-                      labs(
-                        title = "Pairwise mixed models for Bray-Curtis distance",
-                        x = "Coefficient on Bray-Curtis distance",
-                        y = NULL,
-                        color = "q <= 0.1"
-                      ) +
-                      theme(legend.position = "top")
-
-                    ggsave(
-                      figure_file(13, "pairwise_similarity_mixed"),
-                      figure_13,
-                      width = 13,
-                      height = 8.5,
-                      device = grDevices::svg
-                    )
-                    print(figure_13)
-
-                    margin_plot_df <- adjusted_margins |>
-                      mutate(
-                        term_label = factor(
-                          term_label,
-                          levels = c("Same patient", "Same chronicity", "Same body region", "Same exact location")
-                        ),
-                        level = factor(level, levels = c("Not shared", "Shared"))
-                      )
-
-                    figure_22 <- ggplot(margin_plot_df, aes(x = emmean, y = level, color = level)) +
-                      geom_line(aes(group = term_label), color = "grey70", linewidth = 0.6) +
-                      geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.15, linewidth = 0.8) +
-                      geom_point(size = 2.8) +
-                      facet_wrap(~term_label, ncol = 2, scales = "free_y") +
-                      scale_color_manual(values = c("Not shared" = "#6c757d", "Shared" = "#b22222")) +
-                      labs(
-                        title = "Adjusted predicted Bray-Curtis distance from pairwise mixed models",
-                        subtitle = "Other pairwise indicators held at 0; technical covariates fixed at cohort means",
-                        x = "Adjusted predicted Bray-Curtis distance",
-                        y = NULL,
-                        color = NULL
-                      ) +
-                      theme(legend.position = "top")
-
-                    ggsave(
-                      figure_file(22, "pairwise_adjusted_margins"),
-                      figure_22,
-                      width = 11.5,
-                      height = 8.5,
-                      device = grDevices::svg
-                    )
-                    print(figure_22)
-
-                    community_findings <- tibble(
-                      finding = c(
-                        sprintf("Positive result: %d PERMANOVA terms reached q <= 0.1 after mutual adjustment.", sum(permanova_plot_df$qvalue <= 0.1, na.rm = TRUE)),
-                        sprintf("Positive result: %d pairwise mixed-model terms reached q <= 0.1 across the two similarity models.", sum(pairwise_effects$qvalue <= 0.1, na.rm = TRUE)),
-                        "Positive result: adjusted marginal predictions were generated for same-patient, same-chronicity, same-body-region, and same-location contrasts using the fitted pairwise mixed models.",
-                        "Positive result: the pairwise models now explicitly adjust for same-batch technical matching, host fraction, bacterial depth, and patient-relative elapsed-time gap while testing shared biological covariates.",
-                        "Negative result: patient is handled by restricted permutations in PERMANOVA and by sample-level random intercepts in the pairwise model, not by a single multivariate random-effect framework."
+                    outputs <- tibble(
+                      output = c(
+                        table_file(29, "adjusted_community_permanova"),
+                        table_file(30, "pairwise_similarity_mixed_effects"),
+                        table_file(31, "pairwise_similarity_model_status"),
+                        table_file(38, "pairwise_adjusted_margins"),
+                        table_file(39, "pairwise_similarity_mixed_effects_exact_location_sensitivity"),
+                        table_file(40, "pairwise_similarity_model_status_exact_location_sensitivity"),
+                        table_file(41, "pairwise_adjusted_margins_exact_location_sensitivity")
                       )
                     )
-
-                    print(community_findings)
+                    print(outputs)
                     """
                 ),
             ],
         ),
         (
-            "13_culture_threshold_and_concordance.ipynb",
+            "12_adjusted_community_structure_plots.ipynb",
             [
                 md(
                     """
-                    # 13. Culture Threshold Sweep And Adjusted Concordance
+                    # 12. Adjusted Community Structure Plots (Python)
 
-                    This notebook expands the culture-versus-metagenomics comparison in three ways:
-                    threshold sweeps from 0% to 10% relative abundance, a grid of Venn-style overlap diagrams across display cutoffs,
-                    and nuisance-adjusted rank-based mixed models that retain patient and batch random effects while adjusting only for host burden
-                    and bacterial depth. Descriptive analyses use all sequenced samples, whereas adjusted models apply a light
-                    bacterial-depth filter (`bacterial_species_reads >= 5000`) to reduce the noisiest host-dominated samples.
+                    This notebook reads the saved table outputs from the R analysis notebook
+                    and renders the adjusted PERMANOVA, pairwise mixed-effects, and adjusted-margin figures.
+                    """
+                ),
+                code(COMMON_SETUP),
+                md(
+                    """
+                    ## Load Inputs
+                    """
+                ),
+                code(
+                    """
+                    import math
+                    from pathlib import Path
+
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+                    import pandas as pd
+                    import seaborn as sns
+                    from IPython.display import SVG
+                    from matplotlib.lines import Line2D
+
+                    sns.set_theme(style="whitegrid", context="talk")
+                    plt.rcParams["svg.fonttype"] = "none"
+                    plt.rcParams["pdf.fonttype"] = 42
+
+                    permanova_table = pd.read_csv(
+                        wc.table_path(context, 29, "adjusted_community_permanova"), sep="\\t"
+                    )
+                    pairwise_effects_body = pd.read_csv(
+                        wc.table_path(context, 30, "pairwise_similarity_mixed_effects"), sep="\\t"
+                    )
+                    pairwise_effects_exact = pd.read_csv(
+                        wc.table_path(context, 39, "pairwise_similarity_mixed_effects_exact_location_sensitivity"), sep="\\t"
+                    )
+                    adjusted_margins_body = pd.read_csv(
+                        wc.table_path(context, 38, "pairwise_adjusted_margins"), sep="\\t"
+                    )
+                    adjusted_margins_exact = pd.read_csv(
+                        wc.table_path(context, 41, "pairwise_adjusted_margins_exact_location_sensitivity"), sep="\\t"
+                    )
+                    """
+                ),
+                md(
+                    """
+                    ## Define Plot Helpers
+                    """
+                ),
+                code(
+                    """
+                    MODEL_LABELS = {
+                        "body_region_model": "Body-region model",
+                        "exact_location_model": "Exact-location model",
+                    }
+
+
+                    def save_svg_and_jpg(fig: plt.Figure, output_path: Path) -> None:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        fig.savefig(output_path, bbox_inches="tight")
+                        fig.savefig(output_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
+
+
+                    def plot_adjusted_permanova(table_df: pd.DataFrame, output_path: Path) -> None:
+                        plot_df = table_df.loc[~table_df["term"].isin(["Residual", "Total"])].copy()
+                        plot_df = plot_df.sort_values("r2", ascending=True)
+                        plot_df["significant"] = plot_df["qvalue"].fillna(1.0) <= 0.1
+                        colors = plot_df["significant"].map({True: "#b22222", False: "#3b6a8f"}).tolist()
+
+                        fig, ax = plt.subplots(figsize=(11, 7.5))
+                        ax.barh(plot_df["term_label"], plot_df["r2"], color=colors)
+                        ax.set_xlabel("Marginal R2")
+                        ax.set_ylabel("")
+                        ax.set_title("Adjusted PERMANOVA on Bray-Curtis community structure")
+                        legend_handles = [
+                            Line2D([0], [0], marker="s", color="none", markerfacecolor="#b22222", markeredgecolor="#b22222", markersize=10, label="q <= 0.1"),
+                            Line2D([0], [0], marker="s", color="none", markerfacecolor="#3b6a8f", markeredgecolor="#3b6a8f", markersize=10, label="q > 0.1"),
+                        ]
+                        ax.legend(handles=legend_handles, frameon=False, loc="lower right")
+                        fig.tight_layout()
+                        save_svg_and_jpg(fig, output_path)
+                        plt.close(fig)
+
+
+                    def plot_pairwise_effects(effects: pd.DataFrame, output_path: Path) -> None:
+                        if effects.empty:
+                            fig, ax = plt.subplots(figsize=(8, 5))
+                            ax.text(0.5, 0.5, "No pairwise-effect rows available.", ha="center", va="center", transform=ax.transAxes)
+                            ax.set_axis_off()
+                            save_svg_and_jpg(fig, output_path)
+                            plt.close(fig)
+                            return
+
+                        if "effect" in effects.columns:
+                            effects = effects.loc[effects["effect"] == "fixed"].copy()
+                        effects["model_label"] = effects["model"].map(MODEL_LABELS).fillna(effects["model"])
+                        effects["significant"] = effects["qvalue"].fillna(1.0) <= 0.1
+
+                        preferred_terms = [
+                            "Same patient",
+                            "Same batch date",
+                            "Same body region",
+                            "Same exact location",
+                            "Same chronicity",
+                            "Same culture positivity",
+                            "Elapsed-time gap (years)",
+                            "Mean host fraction",
+                            "Mean bacterial read depth",
+                        ]
+                        observed_terms = effects["term_label"].dropna().unique().tolist()
+                        ordered_terms = [term for term in preferred_terms if term in observed_terms]
+                        ordered_terms.extend([term for term in sorted(observed_terms) if term not in ordered_terms])
+                        y_order = list(reversed(ordered_terms))
+
+                        model_order = [model for model in ["body_region_model", "exact_location_model"] if model in effects["model"].unique()]
+                        if not model_order:
+                            model_order = sorted(effects["model"].dropna().unique().tolist())
+                        model_labels = [MODEL_LABELS.get(model, model) for model in model_order]
+
+                        fig, axes = plt.subplots(
+                            1,
+                            len(model_order),
+                            figsize=(6.5 * len(model_order), max(5.0, 0.55 * len(y_order))),
+                            sharey=True,
+                        )
+                        if len(model_order) == 1:
+                            axes = [axes]
+
+                        color_map = {True: "#b22222", False: "#3b6a8f"}
+                        for ax, model, model_label in zip(axes, model_order, model_labels):
+                            sub = effects.loc[effects["model"] == model].copy()
+                            ax.axvline(0.0, linestyle="--", color="#808080", linewidth=0.8)
+                            for _, row in sub.iterrows():
+                                if row["term_label"] not in y_order:
+                                    continue
+                                y_pos = y_order.index(row["term_label"])
+                                x = float(row["estimate"])
+                                low = float(row["conf.low"])
+                                high = float(row["conf.high"])
+                                color = color_map[bool(row["significant"])]
+                                ax.errorbar(
+                                    x=x,
+                                    y=y_pos,
+                                    xerr=[[x - low], [high - x]],
+                                    fmt="o",
+                                    color=color,
+                                    ecolor=color,
+                                    elinewidth=1.0,
+                                    capsize=3,
+                                    markersize=6,
+                                )
+
+                            ax.set_title(model_label)
+                            ax.set_xlabel("Coefficient on Bray-Curtis distance")
+                            ax.set_yticks(np.arange(len(y_order)))
+                            ax.set_yticklabels(y_order)
+
+                        axes[0].set_ylabel("")
+                        legend_handles = [
+                            Line2D([0], [0], marker="o", color="none", markerfacecolor="#b22222", markeredgecolor="#b22222", label="q <= 0.1"),
+                            Line2D([0], [0], marker="o", color="none", markerfacecolor="#3b6a8f", markeredgecolor="#3b6a8f", label="q > 0.1"),
+                        ]
+                        fig.legend(handles=legend_handles, frameon=False, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.02))
+                        fig.suptitle("Pairwise mixed models for Bray-Curtis distance", y=1.06)
+                        fig.tight_layout()
+                        save_svg_and_jpg(fig, output_path)
+                        plt.close(fig)
+
+
+                    def plot_adjusted_margins(margins: pd.DataFrame, output_path: Path) -> None:
+                        if margins.empty:
+                            fig, ax = plt.subplots(figsize=(8, 5))
+                            ax.text(0.5, 0.5, "No adjusted-margin rows available.", ha="center", va="center", transform=ax.transAxes)
+                            ax.set_axis_off()
+                            save_svg_and_jpg(fig, output_path)
+                            plt.close(fig)
+                            return
+
+                        preferred_terms = ["Same patient", "Same chronicity", "Same body region", "Same exact location"]
+                        observed_terms = margins["term_label"].dropna().unique().tolist()
+                        term_order = [term for term in preferred_terms if term in observed_terms]
+                        term_order.extend([term for term in sorted(observed_terms) if term not in term_order])
+
+                        ncols = 2
+                        nrows = max(1, math.ceil(len(term_order) / ncols))
+                        fig, axes = plt.subplots(nrows, ncols, figsize=(11.5, max(4.5, 3.4 * nrows)), squeeze=False)
+                        axes_flat = [ax for row in axes for ax in row]
+
+                        level_order = ["Not shared", "Shared"]
+                        level_colors = {"Not shared": "#6c757d", "Shared": "#b22222"}
+                        y_map = {level: idx for idx, level in enumerate(level_order)}
+
+                        for ax, term in zip(axes_flat, term_order):
+                            sub = margins.loc[margins["term_label"] == term].copy()
+                            if sub.empty:
+                                ax.set_axis_off()
+                                continue
+                            sub["level"] = pd.Categorical(sub["level"], categories=level_order, ordered=True)
+                            sub = sub.sort_values("level")
+
+                            xs = []
+                            ys = []
+                            for _, row in sub.iterrows():
+                                level = row["level"]
+                                if pd.isna(level):
+                                    continue
+                                y = y_map[str(level)]
+                                x = float(row["emmean"])
+                                low = float(row["conf.low"])
+                                high = float(row["conf.high"])
+                                ax.errorbar(
+                                    x=x,
+                                    y=y,
+                                    xerr=[[x - low], [high - x]],
+                                    fmt="o",
+                                    color=level_colors[str(level)],
+                                    ecolor=level_colors[str(level)],
+                                    elinewidth=1.2,
+                                    capsize=3,
+                                    markersize=7,
+                                )
+                                xs.append(x)
+                                ys.append(y)
+
+                            if len(xs) >= 2:
+                                ax.plot(xs, ys, color="#a0a0a0", linewidth=0.9)
+
+                            ax.set_title(term)
+                            ax.set_yticks([y_map[level] for level in level_order])
+                            ax.set_yticklabels(level_order)
+                            ax.set_xlabel("Adjusted predicted Bray-Curtis distance")
+                            ax.set_ylabel("")
+
+                        for ax in axes_flat[len(term_order) :]:
+                            ax.set_axis_off()
+
+                        legend_handles = [
+                            Line2D([0], [0], marker="o", color="none", markerfacecolor=level_colors["Not shared"], markeredgecolor=level_colors["Not shared"], label="Not shared"),
+                            Line2D([0], [0], marker="o", color="none", markerfacecolor=level_colors["Shared"], markeredgecolor=level_colors["Shared"], label="Shared"),
+                        ]
+                        fig.legend(handles=legend_handles, frameon=False, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.01))
+                        fig.suptitle(
+                            "Adjusted predicted Bray-Curtis distance from pairwise mixed models\\nOther pairwise indicators held at 0; technical covariates fixed at cohort means",
+                            y=1.06,
+                        )
+                        fig.tight_layout()
+                        save_svg_and_jpg(fig, output_path)
+                        plt.close(fig)
+                    """
+                ),
+                md(
+                    """
+                    ## Render Figure 12 Panels
+                    """
+                ),
+                code(
+                    """
+                    fig_12_01 = wc.figure_path(context, 12, "adjusted_permanova")
+                    plot_adjusted_permanova(permanova_table, fig_12_01)
+
+                    body_effects = pairwise_effects_body.copy()
+                    body_effects["model"] = "body_region_model"
+                    fig_12_02 = wc.figure_path(context, 13, "pairwise_similarity_mixed")
+                    plot_pairwise_effects(body_effects, fig_12_02)
+
+                    fig_12_03 = wc.figure_path(context, 22, "pairwise_adjusted_margins")
+                    plot_adjusted_margins(adjusted_margins_body, fig_12_03)
+
+                    exact_effects = pairwise_effects_exact.copy()
+                    exact_effects["model"] = "exact_location_model"
+                    fig_12_04 = wc.figure_path(context, 23, "pairwise_similarity_mixed_exact_location_sensitivity")
+                    plot_pairwise_effects(exact_effects, fig_12_04)
+
+                    fig_12_05 = wc.figure_path(context, 24, "pairwise_adjusted_margins_exact_location_sensitivity")
+                    plot_adjusted_margins(adjusted_margins_exact, fig_12_05)
+
+                    display(SVG(filename=str(fig_12_01)))
+                    display(SVG(filename=str(fig_12_02)))
+                    display(SVG(filename=str(fig_12_03)))
+                    display(SVG(filename=str(fig_12_04)))
+                    display(SVG(filename=str(fig_12_05)))
+                    """
+                ),
+            ],
+        ),
+        (
+            "13_culture_threshold_and_concordance_analysis.ipynb",
+            [
+                md(
+                    """
+                    # 13. Culture Threshold And Concordance Analysis (R)
+
+                    This notebook performs the analysis side of the culture-versus-metagenomics comparison:
+                    descriptive Mann-Whitney concordance tests, threshold sweeps from 0% to 10% relative abundance,
+                    Venn overlap table generation across display cutoffs, and nuisance-adjusted rank-based mixed models.
+                    It writes all table outputs used by the plotting notebook.
                     """
                 ),
                 code(
@@ -2897,7 +3325,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                 ),
                 md(
                     """
-                    ## Load Species Abundances And Define Culture Organism Groups
+                    ## Load Species Abundances, Define Culture Groups, And Compute Descriptive Concordance
                     """
                 ),
                 code(
@@ -2950,7 +3378,55 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     culture_model_data <- qc |>
                       left_join(group_abundance, by = "sample_id")
 
+                    descriptive_rows <- vector("list", length = 0)
+                    for (idx in seq_len(nrow(culture_groups))) {
+                      group_name <- culture_groups$group[idx]
+                      group_label <- culture_groups$label[idx]
+                      culture_col <- culture_groups$culture_col[idx]
+                      observed <- as.logical(culture_model_data[[culture_col]])
+                      abundance <- culture_model_data[[group_name]]
+                      positive_values <- abundance[observed]
+                      negative_values <- abundance[!observed]
+                      n_positive <- sum(observed, na.rm = TRUE)
+                      n_negative <- sum(!observed, na.rm = TRUE)
+                      if (n_positive > 0 && n_negative > 0) {
+                        test <- suppressWarnings(wilcox.test(positive_values, negative_values, alternative = "greater", exact = FALSE))
+                        pvalue <- unname(test$p.value)
+                        u_stat <- unname(test$statistic)
+                      } else {
+                        pvalue <- NA_real_
+                        u_stat <- NA_real_
+                      }
+                      descriptive_rows[[length(descriptive_rows) + 1]] <- tibble(
+                        group = group_name,
+                        label = group_label,
+                        n_culture_positive = n_positive,
+                        n_culture_negative = n_negative,
+                        u_statistic = u_stat,
+                        pvalue = pvalue
+                      )
+                    }
+                    descriptive_concordance <- bind_rows(descriptive_rows) |>
+                      mutate(qvalue = if_else(!is.na(pvalue), p.adjust(pvalue, method = "BH"), NA_real_))
+                    write_tsv(descriptive_concordance, table_file(42, "culture_concordance_descriptive"))
+
+                    abundance_plot_df <- culture_model_data |>
+                      select(sample_id, all_of(culture_groups$culture_col), all_of(culture_groups$group)) |>
+                      pivot_longer(cols = all_of(culture_groups$group), names_to = "group", values_to = "rel_abundance") |>
+                      left_join(culture_groups |> select(group, label, culture_col), by = "group") |>
+                      rowwise() |>
+                      mutate(culture_status = if_else(as.logical(cur_data()[[culture_col]]), "Culture positive", "Culture negative")) |>
+                      ungroup() |>
+                      group_by(group, label, culture_status) |>
+                      filter(n() > 0) |>
+                      ungroup() |>
+                      mutate(log10_rel_abundance = log10(rel_abundance + 1e-6)) |>
+                      select(sample_id, group, label, culture_status, rel_abundance, log10_rel_abundance)
+
+                    write_tsv(abundance_plot_df, table_file(43, "culture_abundance_plot_data"))
+
                     print(culture_groups)
+                    print(descriptive_concordance)
                     """
                 ),
                 md(
@@ -3016,7 +3492,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                       slice_head(n = 1) |>
                       ungroup()
 
-                    display_cutoffs <- c(0, 0.001, 0.005, 0.01, 0.05, 0.10)
+                    display_cutoffs <- c(0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.10)
                     venn_counts <- threshold_sweep |>
                       filter(round(threshold, 6) %in% round(display_cutoffs, 6)) |>
                       transmute(
@@ -3083,30 +3559,39 @@ def build_notebooks(output_dir: Path) -> list[Path]:
 
                       n_positive <- sum(model_df$culture_status == "Culture positive")
                       n_negative <- sum(model_df$culture_status == "Culture negative")
-                      if (n_positive < 4 || n_negative < 4 || sd(model_df$normal_score_abundance) == 0) {
+                      if (n_positive == 0 || n_negative == 0 || sd(model_df$normal_score_abundance) == 0) {
                         concordance_rows[[length(concordance_rows) + 1]] <- tibble(
                           group = group_name,
                           label = group_label,
                           threshold = threshold_used,
                           n_samples = nrow(model_df),
                           n_positive = n_positive,
+                          n_negative = n_negative,
                           predictor = "normal_score_abundance",
-                          status = "skipped",
+                          status = "failed_before_fit",
+                          singular_fit = NA,
                           estimate = NA_real_,
                           conf.low = NA_real_,
                           conf.high = NA_real_,
                           pvalue = NA_real_,
                           qvalue = NA_real_,
-                          detail = "Too few positives/negatives or no variation in the rank-normalized metagenomic abundance response."
+                          detail = "No class variation or no variation in the rank-normalized metagenomic abundance response."
                         )
                         next
                       }
 
+                      fit_warnings <- character(0)
                       fit <- tryCatch(
-                        lmer(
-                          normal_score_abundance ~ culture_status + host_removed_fraction + log10_bacterial_reads + (1 | patient_id) + (1 | batch_id),
-                          data = model_df,
-                          REML = FALSE
+                        withCallingHandlers(
+                          lmer(
+                            normal_score_abundance ~ culture_status + host_removed_fraction + log10_bacterial_reads + (1 | patient_id) + (1 | batch_id),
+                            data = model_df,
+                            REML = FALSE
+                          ),
+                          warning = function(w) {
+                            fit_warnings <<- c(fit_warnings, conditionMessage(w))
+                            invokeRestart("muffleWarning")
+                          }
                         ),
                         error = function(e) e
                       )
@@ -3118,8 +3603,10 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                           threshold = threshold_used,
                           n_samples = nrow(model_df),
                           n_positive = n_positive,
+                          n_negative = n_negative,
                           predictor = "normal_score_abundance",
                           status = "failed",
+                          singular_fit = NA,
                           estimate = NA_real_,
                           conf.low = NA_real_,
                           conf.high = NA_real_,
@@ -3132,8 +3619,22 @@ def build_notebooks(output_dir: Path) -> list[Path]:
 
                       abundance_term <- tidy(fit, effects = "fixed", conf.int = TRUE, conf.method = "Wald") |>
                         filter(term == "culture_statusCulture positive")
-                      fit_status <- if (nrow(abundance_term) == 0 || is.na(abundance_term$p.value) || is.na(abundance_term$conf.low) || is.na(abundance_term$conf.high)) "separated" else "ok"
-                      fit_detail <- if (fit_status == "ok") "" else "Model showed undefined Wald intervals for the culture-status effect in the rank-based mixed model."
+                      fit_singular <- isSingular(fit, tol = 1e-5)
+                      fit_status <- case_when(
+                        nrow(abundance_term) == 0 || is.na(abundance_term$p.value) || is.na(abundance_term$conf.low) || is.na(abundance_term$conf.high) ~ "separated",
+                        fit_singular ~ "ok_singular",
+                        TRUE ~ "ok"
+                      )
+                      fit_detail <- c()
+                      if (fit_status == "separated") {
+                        fit_detail <- c(fit_detail, "Model showed undefined Wald intervals for the culture-status effect in the rank-based mixed model.")
+                      }
+                      if (fit_singular) {
+                        fit_detail <- c(fit_detail, "Singular random-effects fit (boundary variance estimate).")
+                      }
+                      if (length(fit_warnings) > 0) {
+                        fit_detail <- c(fit_detail, unique(fit_warnings))
+                      }
 
                       concordance_rows[[length(concordance_rows) + 1]] <- tibble(
                         group = group_name,
@@ -3141,19 +3642,21 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                         threshold = threshold_used,
                         n_samples = nrow(model_df),
                         n_positive = n_positive,
+                        n_negative = n_negative,
                         predictor = "normal_score_abundance",
                         status = fit_status,
+                        singular_fit = fit_singular,
                         estimate = abundance_term$estimate,
                         conf.low = abundance_term$conf.low,
                         conf.high = abundance_term$conf.high,
                         pvalue = abundance_term$p.value,
                         qvalue = NA_real_,
-                        detail = fit_detail
+                        detail = paste(unique(fit_detail), collapse = " | ")
                       )
                     }
 
                     concordance_table <- bind_rows(concordance_rows)
-                    ok_rows <- concordance_table$status == "ok" & !is.na(concordance_table$pvalue)
+                    ok_rows <- concordance_table$status %in% c("ok", "ok_singular") & !is.na(concordance_table$pvalue)
                     concordance_table$qvalue[ok_rows] <- p.adjust(concordance_table$pvalue[ok_rows], method = "BH")
 
                     write_tsv(concordance_table, table_file(34, "culture_mixed_concordance"))
@@ -3163,158 +3666,619 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                 ),
                 md(
                     """
-                    ## Summarize Threshold, Overlap, And Adjusted Concordance Results
+                    ## Review Numbered Table Outputs
                     """
                 ),
                 code(
                     """
-                    sweep_plot_df <- threshold_sweep |>
-                      left_join(optimal_thresholds |> select(group, threshold_opt = threshold), by = "group")
-
-                    figure_14 <- ggplot(sweep_plot_df, aes(x = threshold * 100, y = f1)) +
-                      geom_line(color = "#3b6a8f", linewidth = 0.8) +
-                      geom_vline(aes(xintercept = threshold_opt * 100), color = "#b22222", linetype = "dashed", linewidth = 0.5) +
-                      facet_wrap(~label, scales = "free_y") +
-                      labs(
-                        title = "Culture-versus-metagenomics threshold sweep",
-                        x = "Relative-abundance detection threshold (%)",
-                        y = "F1 score"
+                    outputs <- tibble(
+                      output = c(
+                        table_file(32, "culture_threshold_sweep"),
+                        table_file(33, "culture_optimal_thresholds"),
+                        table_file(34, "culture_mixed_concordance"),
+                        table_file(35, "culture_venn_counts"),
+                        table_file(42, "culture_concordance_descriptive"),
+                        table_file(43, "culture_abundance_plot_data")
                       )
-
-                    ggsave(
-                      figure_file(14, "culture_threshold_sweep"),
-                      figure_14,
-                      width = 13,
-                      height = 9,
-                      device = grDevices::svg
                     )
-                    print(figure_14)
+                    print(outputs)
+                    """
+                ),
+            ],
+        ),
+        (
+            "13_culture_threshold_and_concordance_plots.ipynb",
+            [
+                md(
+                    """
+                    # 13. Culture Threshold And Concordance Plots (Python)
 
-                    venn_plot_path <- figure_file(15, "culture_venn_diagrams")
-                    old_par <- par(no.readonly = TRUE)
-                    cutoff_levels <- sort(unique(venn_counts$threshold))
-                    svg(venn_plot_path, width = 2.35 * length(cutoff_levels), height = 1.95 * nrow(culture_groups))
-                    par(mfrow = c(nrow(culture_groups), length(cutoff_levels)), mar = c(0.5, 0.5, 1.9, 0.5), oma = c(1.5, 3.2, 1.2, 0.6))
-                    theta <- seq(0, 2 * pi, length.out = 200)
-                    for (group_idx in seq_len(nrow(culture_groups))) {
-                      group_name <- culture_groups$group[group_idx]
-                      group_label <- culture_groups$label[group_idx]
-                      for (cutoff_idx in seq_along(cutoff_levels)) {
-                        cutoff <- cutoff_levels[cutoff_idx]
-                        row <- venn_counts |>
-                          filter(group == group_name, round(threshold, 6) == round(cutoff, 6)) |>
-                          slice_head(n = 1)
-                        plot.new()
-                        plot.window(xlim = c(0, 1), ylim = c(0, 1), asp = 1)
-                        polygon(0.38 + 0.23 * cos(theta), 0.5 + 0.23 * sin(theta), col = rgb(0.23, 0.42, 0.56, 0.3), border = "#3b6a8f")
-                        polygon(0.62 + 0.23 * cos(theta), 0.5 + 0.23 * sin(theta), col = rgb(0.70, 0.13, 0.13, 0.3), border = "#b22222")
-                        text(0.30, 0.50, row$culture_only, cex = 0.9)
-                        text(0.50, 0.50, row$both, cex = 0.95, font = 2)
-                        text(0.70, 0.50, row$sequencing_only, cex = 0.9)
-                        text(0.50, 0.15, row$neither, cex = 0.75)
-                        if (group_idx == 1) {
-                          title(main = paste0(sprintf("%.1f", cutoff * 100), "%"), line = 0.2, cex.main = 0.85)
+                    This notebook reads the numbered table outputs from the R analysis notebook
+                    and generates Figure 13 panels directly in Python/matplotlib/seaborn.
+                    """
+                ),
+                code(COMMON_SETUP),
+                md(
+                    """
+                    ## Load Table Inputs
+                    """
+                ),
+                code(
+                    """
+                    import math
+                    from pathlib import Path
+
+                    import matplotlib.pyplot as plt
+                    import numpy as np
+                    import pandas as pd
+                    import seaborn as sns
+                    from IPython.display import SVG
+                    from matplotlib.lines import Line2D
+                    from matplotlib.patches import Circle
+
+                    try:
+                        from matplotlib_venn import venn2
+                    except Exception:
+                        venn2 = None
+
+                    sns.set_theme(style="whitegrid", context="talk")
+                    plt.rcParams["svg.fonttype"] = "none"
+                    plt.rcParams["pdf.fonttype"] = 42
+
+                    threshold_sweep = pd.read_csv(
+                        wc.table_path(context, 32, "culture_threshold_sweep"), sep="\\t"
+                    )
+                    optimal_thresholds = pd.read_csv(
+                        wc.table_path(context, 33, "culture_optimal_thresholds"), sep="\\t"
+                    )
+                    mixed_concordance = pd.read_csv(
+                        wc.table_path(context, 34, "culture_mixed_concordance"), sep="\\t"
+                    )
+                    venn_counts = pd.read_csv(
+                        wc.table_path(context, 35, "culture_venn_counts"), sep="\\t"
+                    )
+                    descriptive_concordance = pd.read_csv(
+                        wc.table_path(context, 42, "culture_concordance_descriptive"), sep="\\t"
+                    )
+                    abundance_plot_df = pd.read_csv(
+                        wc.table_path(context, 43, "culture_abundance_plot_data"), sep="\\t"
+                    )
+                    """
+                ),
+                md(
+                    """
+                    ## Define Plotting Helpers
+                    """
+                ),
+                code(
+                    """
+                    DISPLAY_THRESHOLDS = [0.0, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1]
+
+
+                    def save_svg_and_jpg(fig: plt.Figure, output_path: Path) -> None:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        fig.savefig(output_path, bbox_inches="tight")
+                        fig.savefig(output_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
+
+
+                    def axes_grid(
+                        n_panels: int,
+                        ncols: int = 3,
+                        panel_width: float = 4.5,
+                        panel_height: float = 3.4,
+                        sharex: bool = False,
+                        sharey: bool = False,
+                    ):
+                        ncols = max(1, min(ncols, n_panels if n_panels > 0 else 1))
+                        nrows = max(1, math.ceil(n_panels / ncols))
+                        fig, axes = plt.subplots(
+                            nrows,
+                            ncols,
+                            figsize=(panel_width * ncols, panel_height * nrows),
+                            squeeze=False,
+                            sharex=sharex,
+                            sharey=sharey,
+                        )
+                        flat_axes = [ax for row in axes for ax in row]
+                        return fig, flat_axes
+
+
+                    def plot_threshold_sweep(
+                        threshold_data: pd.DataFrame,
+                        optimal_data: pd.DataFrame,
+                        output_path: Path,
+                    ) -> None:
+                        merged = threshold_data.merge(
+                            optimal_data[["group", "threshold"]].rename(columns={"threshold": "threshold_opt"}),
+                            on="group",
+                            how="left",
+                        )
+                        label_order = (
+                            threshold_data[["group", "label"]]
+                            .drop_duplicates()
+                            .sort_values("group")["label"]
+                            .tolist()
+                        )
+                        fig, axes = axes_grid(
+                            len(label_order),
+                            ncols=3,
+                            panel_width=4.4,
+                            panel_height=3.1,
+                        )
+                        for idx, label in enumerate(label_order):
+                            ax = axes[idx]
+                            sub = merged.loc[merged["label"] == label].sort_values("threshold")
+                            ax.plot(sub["threshold"] * 100.0, sub["f1"], color="#3b6a8f", linewidth=1.4)
+                            if sub["threshold_opt"].notna().any():
+                                x_opt = float(sub["threshold_opt"].dropna().iloc[0] * 100.0)
+                                ax.axvline(x_opt, color="#b22222", linestyle="--", linewidth=1.0)
+                            ax.set_title(label, fontsize=10)
+                            ax.set_xlabel("Threshold (%)", fontsize=9)
+                            ax.set_ylabel("F1", fontsize=9)
+                            ax.set_xlim(0, 10)
+                            ax.set_ylim(0, 1.05)
+                            ax.tick_params(labelsize=8)
+
+                        for ax in axes[len(label_order) :]:
+                            ax.set_axis_off()
+
+                        fig.suptitle("Culture-versus-metagenomics threshold sweep", y=0.995, fontsize=13)
+                        fig.tight_layout(rect=(0, 0, 1, 0.98))
+                        save_svg_and_jpg(fig, output_path)
+                        plt.close(fig)
+
+
+                    def circle_intersection_area(r1: float, r2: float, d: float) -> float:
+                        if d >= r1 + r2:
+                            return 0.0
+                        if d <= abs(r1 - r2):
+                            return math.pi * min(r1, r2) ** 2
+                        term1 = r1**2 * math.acos((d**2 + r1**2 - r2**2) / (2 * d * r1))
+                        term2 = r2**2 * math.acos((d**2 + r2**2 - r1**2) / (2 * d * r2))
+                        term3 = 0.5 * math.sqrt(
+                            (-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)
+                        )
+                        return term1 + term2 - term3
+
+
+                    def solve_center_distance(r1: float, r2: float, target_intersection: float) -> float:
+                        max_overlap = math.pi * min(r1, r2) ** 2
+                        target = min(max(target_intersection, 0.0), max_overlap)
+                        if target <= 0:
+                            return r1 + r2 + max(r1, r2) * 0.35
+                        if abs(target - max_overlap) < 1e-12:
+                            return abs(r1 - r2)
+                        lo = abs(r1 - r2) + 1e-10
+                        hi = r1 + r2 - 1e-10
+                        for _ in range(80):
+                            mid = 0.5 * (lo + hi)
+                            area = circle_intersection_area(r1, r2, mid)
+                            if area > target:
+                                lo = mid
+                            else:
+                                hi = mid
+                        return 0.5 * (lo + hi)
+
+
+                    def style_venn_axis(ax: plt.Axes) -> None:
+                        ax.set_aspect("equal")
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                        for spine in ax.spines.values():
+                            spine.set_visible(False)
+
+
+                    def draw_with_custom_solver(
+                        ax: plt.Axes,
+                        culture_only: float,
+                        sequencing_only: float,
+                        both: float,
+                        neither: float,
+                    ) -> None:
+                        a_size = max(culture_only + both, 0.0)
+                        b_size = max(sequencing_only + both, 0.0)
+                        overlap = max(both, 0.0)
+
+                        if a_size <= 0 and b_size <= 0:
+                            ax.text(
+                                0.5,
+                                0.57,
+                                "No positive calls",
+                                ha="center",
+                                va="center",
+                                fontsize=8,
+                                transform=ax.transAxes,
+                            )
+                            ax.text(
+                                0.5,
+                                0.35,
+                                f"Neither: {int(round(neither))}",
+                                ha="center",
+                                va="center",
+                                fontsize=8,
+                                transform=ax.transAxes,
+                            )
+                            style_venn_axis(ax)
+                            return
+
+                        r1 = max(math.sqrt(a_size / math.pi), 1e-8)
+                        r2 = max(math.sqrt(b_size / math.pi), 1e-8)
+                        distance = solve_center_distance(r1, r2, overlap)
+
+                        c1, c2 = 0.0, distance
+                        x_min = min(c1 - r1, c2 - r2)
+                        x_max = max(c1 + r1, c2 + r2)
+                        y_lim = max(r1, r2)
+                        pad = max(0.22 * max(r1, r2), 0.2)
+                        center_shift = -0.5 * (x_min + x_max)
+                        c1 += center_shift
+                        c2 += center_shift
+
+                        ax.add_patch(
+                            Circle((c1, 0), r1, facecolor="#3b6a8f", edgecolor="#2f4d63", alpha=0.35, linewidth=1.0)
+                        )
+                        ax.add_patch(
+                            Circle((c2, 0), r2, facecolor="#b22222", edgecolor="#7f1b1b", alpha=0.35, linewidth=1.0)
+                        )
+                        ax.text(c1 - 0.45 * r1, 0, f"{int(round(culture_only))}", ha="center", va="center", fontsize=8)
+                        ax.text((c1 + c2) / 2, 0, f"{int(round(overlap))}", ha="center", va="center", fontsize=8, fontweight="bold")
+                        ax.text(c2 + 0.45 * r2, 0, f"{int(round(sequencing_only))}", ha="center", va="center", fontsize=8)
+                        ax.text(
+                            0.5 * (x_min + x_max) + center_shift,
+                            -(y_lim + 0.55 * pad),
+                            f"Neither: {int(round(neither))}",
+                            ha="center",
+                            va="center",
+                            fontsize=7,
+                        )
+                        ax.set_xlim(x_min - pad + center_shift, x_max + pad + center_shift)
+                        ax.set_ylim(-(y_lim + 1.0 * pad), y_lim + 0.9 * pad)
+                        style_venn_axis(ax)
+
+
+                    def draw_proportional_venn(
+                        ax: plt.Axes,
+                        culture_only: float,
+                        sequencing_only: float,
+                        both: float,
+                        neither: float,
+                    ) -> None:
+                        if venn2 is not None:
+                            venn = venn2(
+                                subsets=(culture_only, sequencing_only, both),
+                                set_labels=("", ""),
+                                ax=ax,
+                            )
+                            if venn is not None:
+                                style_map = {"10": "#3b6a8f", "01": "#b22222", "11": "#6c4a86"}
+                                for key, color in style_map.items():
+                                    patch = venn.get_patch_by_id(key)
+                                    if patch is not None:
+                                        patch.set_facecolor(color)
+                                        patch.set_alpha(0.35)
+                                        patch.set_edgecolor("#404040")
+                                        patch.set_linewidth(0.9)
+
+                                label_values = {
+                                    "10": int(round(culture_only)),
+                                    "11": int(round(both)),
+                                    "01": int(round(sequencing_only)),
+                                }
+                                for key, value in label_values.items():
+                                    text = venn.get_label_by_id(key)
+                                    if text is not None:
+                                        text.set_text(str(value))
+                                        text.set_fontsize(8)
+                                        if key == "11":
+                                            text.set_fontweight("bold")
+
+                                ax.text(
+                                    0.5,
+                                    0.03,
+                                    f"Neither: {int(round(neither))}",
+                                    ha="center",
+                                    va="bottom",
+                                    transform=ax.transAxes,
+                                    fontsize=7,
+                                )
+                                style_venn_axis(ax)
+                                return
+
+                        draw_with_custom_solver(ax, culture_only, sequencing_only, both, neither)
+
+
+                    def plot_venn_grid(venn_data: pd.DataFrame, output_path: Path) -> None:
+                        venn_df = venn_data.copy()
+                        venn_df["threshold"] = venn_df["threshold"].astype(float)
+                        available = sorted(venn_df["threshold"].unique().tolist())
+                        cutoff_levels = [
+                            value
+                            for value in DISPLAY_THRESHOLDS
+                            if any(math.isclose(value, a, rel_tol=0, abs_tol=1e-9) for a in available)
+                        ]
+                        if not cutoff_levels:
+                            cutoff_levels = available
+
+                        group_df = venn_df[["group", "label"]].drop_duplicates()
+                        group_order = group_df["group"].tolist()
+                        group_to_label = dict(zip(group_df["group"], group_df["label"]))
+
+                        n_rows = len(group_order)
+                        n_cols = len(cutoff_levels)
+                        fig, axes = plt.subplots(
+                            n_rows,
+                            n_cols,
+                            figsize=(2.45 * n_cols, 2.05 * n_rows),
+                            squeeze=False,
+                        )
+
+                        for row_idx, group in enumerate(group_order):
+                            for col_idx, cutoff in enumerate(cutoff_levels):
+                                ax = axes[row_idx, col_idx]
+                                row = venn_df.loc[
+                                    (venn_df["group"] == group)
+                                    & (
+                                        np.isclose(
+                                            venn_df["threshold"],
+                                            cutoff,
+                                            rtol=0.0,
+                                            atol=1e-9,
+                                        )
+                                    )
+                                ]
+                                if row.empty:
+                                    ax.text(
+                                        0.5,
+                                        0.5,
+                                        "No data",
+                                        ha="center",
+                                        va="center",
+                                        fontsize=8,
+                                        transform=ax.transAxes,
+                                    )
+                                    style_venn_axis(ax)
+                                else:
+                                    rec = row.iloc[0]
+                                    draw_proportional_venn(
+                                        ax=ax,
+                                        culture_only=float(rec["culture_only"]),
+                                        sequencing_only=float(rec["sequencing_only"]),
+                                        both=float(rec["both"]),
+                                        neither=float(rec["neither"]),
+                                    )
+
+                                if row_idx == 0:
+                                    ax.set_title(f"{cutoff * 100:.1f}%", fontsize=9, pad=4)
+                                if col_idx == 0:
+                                    ax.text(
+                                        -0.26,
+                                        0.5,
+                                        group_to_label[group],
+                                        transform=ax.transAxes,
+                                        rotation=90,
+                                        ha="center",
+                                        va="center",
+                                        fontsize=8,
+                                    )
+
+                        fig.suptitle(
+                            "Culture-only / Both / Sequencing-only overlaps (area-proportional)",
+                            y=0.997,
+                            fontsize=12,
+                        )
+                        fig.text(
+                            0.5,
+                            0.01,
+                            "Display cutoff for metagenomic relative abundance",
+                            ha="center",
+                            fontsize=9,
+                        )
+                        fig.tight_layout(rect=(0.03, 0.03, 1.0, 0.985))
+                        save_svg_and_jpg(fig, output_path)
+                        plt.close(fig)
+
+
+                    def plot_abundance_boxplot(
+                        abundance_df: pd.DataFrame,
+                        summary_df: pd.DataFrame,
+                        output_path: Path,
+                    ) -> None:
+                        q_lookup = {}
+                        if "label" in summary_df.columns and "qvalue" in summary_df.columns:
+                            q_lookup = summary_df.set_index("label")["qvalue"].to_dict()
+
+                        label_order = (
+                            abundance_df[["group", "label"]]
+                            .drop_duplicates()
+                            .sort_values("group")["label"]
+                            .tolist()
+                        )
+                        status_order = ["Culture negative", "Culture positive"]
+                        palette = {
+                            "Culture negative": "#4c78a8",
+                            "Culture positive": "#d65f5f",
                         }
-                        if (cutoff_idx == 1) {
-                          mtext(group_label, side = 2, line = 1.2, cex = 0.8)
-                        }
-                      }
-                    }
-                    mtext("Culture only / Both / Sequencing only / Neither counts", side = 3, outer = TRUE, line = 0.2, cex = 1)
-                    mtext("Display cutoff", side = 1, outer = TRUE, line = 0.3, cex = 0.9)
-                    dev.off()
-                    par(old_par)
 
-                    density_plot_df <- culture_model_data |>
-                      select(sample_id, all_of(culture_groups$culture_col), all_of(culture_groups$group)) |>
-                      pivot_longer(cols = all_of(culture_groups$group), names_to = "group", values_to = "rel_abundance") |>
-                      left_join(culture_groups |> select(group, label, culture_col), by = "group") |>
-                      rowwise() |>
-                      mutate(culture_status = if_else(as.logical(cur_data()[[culture_col]]), "Culture positive", "Culture negative")) |>
-                      ungroup() |>
-                      group_by(group, label, culture_status) |>
-                      filter(n() > 0) |>
-                      ungroup() |>
-                      mutate(log10_rel_abundance = log10(rel_abundance + 1e-6))
+                        fig, axes = axes_grid(
+                            len(label_order),
+                            ncols=3,
+                            panel_width=2.0,
+                            panel_height=3.0,
+                        )
+                        for idx, label in enumerate(label_order):
+                            ax = axes[idx]
+                            sub = abundance_df.loc[abundance_df["label"] == label].copy()
+                            sns.boxplot(
+                                data=sub,
+                                x="culture_status",
+                                y="log10_rel_abundance",
+                                order=status_order,
+                                palette=palette,
+                                width=0.62,
+                                fliersize=3.0,
+                                linewidth=1.0,
+                                ax=ax,
+                            )
+                            qvalue = q_lookup.get(label, np.nan)
+                            if pd.notna(qvalue):
+                                ax.set_title(f"{label} U-test q={qvalue:.4}", fontsize=10)
+                            else:
+                                ax.set_title(label, fontsize=10)
+                            ax.set_xlabel("")
+                            ax.set_ylabel("log10(rel. abundance + 1e-6)", fontsize=9)
+                            ax.set_xticklabels(
+                                [tick.get_text().split()[-1].capitalize() for tick in ax.get_xticklabels()],
+                                rotation=20,
+                                ha="right",
+                                fontsize=8,
+                            )
+                            ax.set_yticklabels(
+                                [tick.get_text() for tick in ax.get_yticklabels()],
+                                fontsize=8,
+                            )
 
-                    if (nrow(density_plot_df) > 0) {
-                      figure_16 <- ggplot(density_plot_df, aes(x = log10_rel_abundance, color = culture_status, fill = culture_status)) +
-                        geom_density(alpha = 0.22, adjust = 1.2) +
-                        facet_wrap(~label, scales = "free_y") +
-                        labs(
-                          title = "Metagenomic abundance by culture status",
-                          x = "log10(relative abundance + 1e-6)",
-                          y = "Density",
-                          color = NULL,
-                          fill = NULL
-                        ) +
-                        theme(legend.position = "top")
-                    } else {
-                      figure_16 <- ggplot() +
-                        annotate("text", x = 0, y = 0, label = "No concordance models ran successfully for density plotting.", size = 5) +
-                        xlim(-1, 1) +
-                        ylim(-1, 1) +
-                        theme_void() +
-                        labs(title = "Metagenomic abundance by culture status")
-                    }
+                        for ax in axes[len(label_order) :]:
+                            ax.set_axis_off()
 
-                    ggsave(
-                      figure_file(16, "culture_abundance_density"),
-                      figure_16,
-                      width = 13,
-                      height = 9,
-                      device = grDevices::svg
-                    )
-                    print(figure_16)
+                        fig.suptitle(
+                            "Metagenomic abundance by culture status (boxplots)",
+                            y=0.995,
+                            fontsize=13,
+                        )
+                        fig.tight_layout(rect=(0, 0, 1, 0.98))
+                        save_svg_and_jpg(fig, output_path)
+                        plt.close(fig)
 
-                    figure_17_df <- concordance_table |>
-                      filter(status == "ok") |>
-                      mutate(
-                        label = factor(label, levels = rev(label[order(estimate)])),
-                        significant = qvalue <= 0.1
-                      )
 
-                    if (nrow(figure_17_df) > 0) {
-                      figure_17 <- ggplot(figure_17_df, aes(x = estimate, y = label, color = significant)) +
-                        geom_vline(xintercept = 0, linewidth = 0.5, linetype = "dashed", color = "grey50") +
-                        geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.18, linewidth = 0.7) +
-                        geom_point(size = 2.6) +
-                        scale_color_manual(values = c("TRUE" = "#b22222", "FALSE" = "#3b6a8f")) +
-                        labs(
-                          title = "Technical/nuisance-adjusted rank-based culture concordance models",
-                          x = "Adjusted difference in rank-normalized abundance\n(Culture positive - Culture negative)",
-                          y = NULL,
-                          color = "q <= 0.1"
-                        ) +
-                        theme(legend.position = "top")
-                    } else {
-                        figure_17 <- ggplot() +
-                        annotate("text", x = 0, y = 0, label = "No adjusted concordance models converged.", size = 5) +
-                        xlim(-1, 1) +
-                        ylim(-1, 1) +
-                        theme_void() +
-                        labs(title = "Technical/nuisance-adjusted rank-based culture concordance models")
-                    }
+                    def plot_adjusted_concordance(
+                        concordance_df: pd.DataFrame,
+                        output_path: Path,
+                    ) -> None:
+                        plot_df = concordance_df.loc[
+                            concordance_df["status"].isin(["ok", "ok_singular"])
+                        ].copy()
+                        if plot_df.empty:
+                            fig, ax = plt.subplots(figsize=(5, 4))
+                            ax.text(
+                                0.5,
+                                0.5,
+                                "No adjusted concordance models converged.",
+                                ha="center",
+                                va="center",
+                                transform=ax.transAxes,
+                            )
+                            ax.set_axis_off()
+                            save_svg_and_jpg(fig, output_path)
+                            plt.close(fig)
+                            return
 
-                    ggsave(
-                      figure_file(17, "culture_adjusted_concordance"),
-                      figure_17,
-                      width = 11,
-                      height = 7.5,
-                      device = grDevices::svg
-                    )
-                    print(figure_17)
+                        plot_df["significant"] = plot_df["qvalue"].fillna(1.0) <= 0.1
+                        plot_df["fit_quality"] = np.where(
+                            plot_df["status"] == "ok_singular",
+                            "Singular fit",
+                            "Regular fit",
+                        )
+                        plot_df = plot_df.sort_values("estimate").reset_index(drop=True)
 
-                    culture_findings <- tibble(
-                      finding = c(
-                        sprintf("Positive result: threshold sweeps were generated for %d cultured organism groups.", n_distinct(threshold_sweep$group)),
-                        sprintf("Positive result: %d organism-specific concordance models ran successfully.", sum(concordance_table$status == "ok")),
-                        "Positive result: the overlap plots now show culture-only versus sequencing-only calls for each organism across multiple displayed cutoffs, not just a single best threshold.",
-                        "Negative result: low-prevalence culture groups can still lead to skipped or unstable rank-based mixed models even after adjusting for patient, batch, host burden, and bacterial depth."
-                      )
-                    )
+                        fig, ax = plt.subplots(figsize=(7, max(5.0, 0.55 * len(plot_df))))
+                        ax.axvline(0, color="#808080", linestyle="--", linewidth=0.9)
+                        color_map = {True: "#b22222", False: "#3b6a8f"}
+                        marker_map = {"Regular fit": "o", "Singular fit": "^"}
 
-                    print(culture_findings)
+                        y_values = np.arange(len(plot_df))
+                        for idx, row in plot_df.iterrows():
+                            x = float(row["estimate"])
+                            low = float(row["conf.low"])
+                            high = float(row["conf.high"])
+                            color = color_map[bool(row["significant"])]
+                            marker = marker_map[row["fit_quality"]]
+                            ax.errorbar(
+                                x=x,
+                                y=idx,
+                                xerr=[[x - low], [high - x]],
+                                fmt=marker,
+                                color=color,
+                                ecolor=color,
+                                elinewidth=1.1,
+                                capsize=3,
+                                markersize=7,
+                            )
+
+                        ax.set_yticks(y_values)
+                        ax.set_yticklabels(plot_df["label"].tolist())
+                        ax.set_xlabel(
+                            "Adjusted difference in rank-normalized abundance\\n(Culture positive - Culture negative)"
+                        )
+                        ax.set_ylabel("")
+                        ax.set_title(
+                            "Technical/nuisance-adjusted rank-based culture concordance models"
+                        )
+
+                        legend_handles = [
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="o",
+                                color="none",
+                                markerfacecolor="#b22222",
+                                markeredgecolor="#b22222",
+                                label="q <= 0.1",
+                            ),
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="o",
+                                color="none",
+                                markerfacecolor="#3b6a8f",
+                                markeredgecolor="#3b6a8f",
+                                label="q > 0.1",
+                            ),
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="o",
+                                color="black",
+                                linestyle="None",
+                                label="Regular fit",
+                            ),
+                            Line2D(
+                                [0],
+                                [0],
+                                marker="^",
+                                color="black",
+                                linestyle="None",
+                                label="Singular fit",
+                            ),
+                        ]
+                        ax.legend(handles=legend_handles, frameon=False, loc="best")
+                        fig.tight_layout()
+                        save_svg_and_jpg(fig, output_path)
+                        plt.close(fig)
+                    """
+                ),
+                md(
+                    """
+                    ## Render Figure 13 Panels From Numbered Tables
+                    """
+                ),
+                code(
+                    """
+                    fig_threshold = wc.figure_path(context, 14, "culture_threshold_sweep")
+                    plot_threshold_sweep(threshold_sweep, optimal_thresholds, fig_threshold)
+
+                    fig_venn = wc.figure_path(context, 15, "culture_venn_diagrams")
+                    plot_venn_grid(venn_counts, fig_venn)
+
+                    fig_abundance = wc.figure_path(context, 16, "culture_abundance_density")
+                    plot_abundance_boxplot(abundance_plot_df, descriptive_concordance, fig_abundance)
+
+                    fig_adjusted = wc.figure_path(context, 17, "culture_adjusted_concordance")
+                    plot_adjusted_concordance(mixed_concordance, fig_adjusted)
+
+                    display(SVG(filename=str(fig_threshold)))
+                    display(SVG(filename=str(fig_venn)))
+                    display(SVG(filename=str(fig_abundance)))
+                    display(SVG(filename=str(fig_adjusted)))
                     """
                 ),
             ],
@@ -3355,11 +4319,11 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     host_effects = pd.read_csv(wc.table_path(context, 9, "host_mixed_effects"), sep="\\t")
                     host_status = pd.read_csv(wc.table_path(context, 10, "host_mixed_status"), sep="\\t")
 
-                    host_extended = (
-                        host_effects.loc[host_effects["model_name"] == "host_extended"]
+                    host_model_effects = (
+                        host_effects.loc[host_effects["model_name"] == advanced.HOST_MODEL_NAME]
                         .copy()
                     )
-                    host_extended = host_extended.loc[host_extended["term"] != "Intercept"].copy()
+                    host_model_effects = host_model_effects.loc[host_model_effects["term"] != "Intercept"].copy()
 
                     def factor_family(term: str) -> str:
                         if "C(body_region" in term:
@@ -3372,12 +4336,12 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                             return "elapsed_time"
                         return "other"
 
-                    host_extended["factor_family"] = host_extended["term"].map(factor_family)
-                    host_extended["term_label"] = host_extended["term"].map(base.prettify_model_term)
-                    host_extended["posthoc_qvalue"] = np.nan
-                    for family, idx in host_extended.groupby("factor_family").groups.items():
-                        pvals = host_extended.loc[list(idx), "pvalue"].to_numpy()
-                        host_extended.loc[list(idx), "posthoc_qvalue"] = multipletests(pvals, method="fdr_bh")[1]
+                    host_model_effects["factor_family"] = host_model_effects["term"].map(factor_family)
+                    host_model_effects["term_label"] = host_model_effects["term"].map(base.prettify_model_term)
+                    host_model_effects["posthoc_qvalue"] = np.nan
+                    for family, idx in host_model_effects.groupby("factor_family").groups.items():
+                        pvals = host_model_effects.loc[list(idx), "pvalue"].to_numpy()
+                        host_model_effects.loc[list(idx), "posthoc_qvalue"] = multipletests(pvals, method="fdr_bh")[1]
 
                     qc = base_data["qc"].copy()
                     host_plot_df = qc.dropna(
@@ -3404,7 +4368,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     )
 
                     METHODS = ["lbfgs", "powell", "bfgs"]
-                    HOST_EXTENDED_FORMULA = advanced.HOST_FORMULAS["host_extended"]
+                    HOST_MODEL_FORMULA = advanced.HOST_FORMULAS[advanced.HOST_MODEL_NAME]
                     VC_FORMULA = {"patient": "0 + C(patient_id)", "batch": "0 + C(batch_id)"}
 
                     def fit_best_gaussian_mixed_model(frame, formula):
@@ -3436,7 +4400,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                             "warnings": " | ".join(sorted(set(warning_messages)))[:2000],
                         }
 
-                    fit, fit_meta = fit_best_gaussian_mixed_model(host_plot_df, HOST_EXTENDED_FORMULA)
+                    fit, fit_meta = fit_best_gaussian_mixed_model(host_plot_df, HOST_MODEL_FORMULA)
 
                     no_body_formula = (
                         "host_logit ~ C(chronicity_group, Treatment('unknown')) "
@@ -3458,7 +4422,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     body_stat, body_df, body_p = likelihood_ratio(fit, no_body_fit)
                     chronicity_stat, chronicity_df, chronicity_p = likelihood_ratio(fit, no_chronicity_fit)
 
-                    gaussian_followup = host_extended.loc[
+                    gaussian_followup = host_model_effects.loc[
                         :,
                         [
                             "model_name",
@@ -3479,7 +4443,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     omnibus_rows = pd.DataFrame(
                         [
                             {
-                                "model_name": "host_extended",
+                                "model_name": advanced.HOST_MODEL_NAME,
                                 "term": "body_region_overall",
                                 "term_label": "Body region overall",
                                 "estimate": np.nan,
@@ -3494,7 +4458,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                                 "df_diff": body_df,
                             },
                             {
-                                "model_name": "host_extended",
+                                "model_name": advanced.HOST_MODEL_NAME,
                                 "term": "chronicity_group_overall",
                                 "term_label": "Chronicity overall",
                                 "estimate": np.nan,
@@ -3539,19 +4503,72 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                 ),
                 code(
                     """
-                    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), gridspec_kw={"width_ratios": [1.1, 1, 1]})
+                    fig, axes = plt.subplots(1, 3, figsize=(21, 5.8), gridspec_kw={"width_ratios": [2.0, 1.0, 1.0]})
 
-                    sns.histplot(
-                        host_plot_df,
-                        x="host_removed_fraction",
-                        bins=18,
-                        kde=True,
-                        color="#355070",
+                    patient_order = (
+                        host_plot_df["patient_id"]
+                        .astype(str)
+                        .dropna()
+                        .drop_duplicates()
+                        .sort_values(key=lambda s: pd.to_numeric(s, errors="coerce").fillna(9999))
+                        .tolist()
+                    )
+                    body_region_order = [region for region in ["lower_extremity", "head_neck", "upper_extremity", "trunk_perineum"] if region in set(host_plot_df["body_region"].astype(str))]
+                    if not body_region_order:
+                        body_region_order = sorted(host_plot_df["body_region"].dropna().astype(str).unique().tolist())
+                    body_region_labels = {
+                        "lower_extremity": "Lower extremity",
+                        "head_neck": "Head/neck",
+                        "upper_extremity": "Upper extremity",
+                        "trunk_perineum": "Trunk/perineum",
+                    }
+                    body_palette = dict(zip(body_region_order, sns.color_palette("Set2", n_colors=len(body_region_order))))
+                    patient_counts = host_plot_df["patient_id"].astype(str).value_counts()
+                    box_patients = set(patient_counts[patient_counts > 3].index.tolist())
+                    box_df = host_plot_df.loc[host_plot_df["patient_id"].astype(str).isin(box_patients)].copy()
+
+                    if not box_df.empty:
+                        sns.boxplot(
+                            data=box_df,
+                            x="patient_id",
+                            y="host_removed_fraction",
+                            order=patient_order,
+                            color="white",
+                            fliersize=0,
+                            width=0.55,
+                            linewidth=1.0,
+                            ax=axes[0],
+                        )
+                    sns.stripplot(
+                        data=host_plot_df,
+                        x="patient_id",
+                        y="host_removed_fraction",
+                        hue="body_region",
+                        order=patient_order,
+                        hue_order=body_region_order,
+                        palette=body_palette,
+                        dodge=False,
+                        jitter=0.22,
+                        size=4.5,
+                        alpha=0.9,
                         ax=axes[0],
                     )
-                    axes[0].set_title("Host fraction distribution")
-                    axes[0].set_xlabel("Host genomic DNA fraction")
-                    axes[0].xaxis.set_major_formatter(PercentFormatter(1))
+                    handles, labels = axes[0].get_legend_handles_labels()
+                    if handles:
+                        display_labels = [body_region_labels.get(label, label) for label in labels]
+                        axes[0].legend(
+                            handles,
+                            display_labels,
+                            title="Body region",
+                            loc="upper left",
+                            bbox_to_anchor=(1.01, 1.0),
+                            frameon=False,
+                        )
+                    axes[0].set_title("Host fraction by patient")
+                    axes[0].set_xlabel("Patient")
+                    axes[0].set_ylabel("Host genomic DNA fraction")
+                    axes[0].tick_params(axis="x", rotation=45)
+                    axes[0].yaxis.set_major_formatter(PercentFormatter(1))
 
                     chronicity_order = ["unknown", "acute_like", "chronic_like", "mixed"]
                     sns.boxplot(
@@ -3604,7 +4621,9 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     axes[2].yaxis.set_major_formatter(PercentFormatter(1))
 
                     fig.tight_layout()
-                    fig.savefig(wc.figure_path(context, 18, "host_fraction_overview"), bbox_inches="tight")
+                    fig_14_01_path = wc.figure_path(context, 18, "host_fraction_overview")
+                    fig.savefig(fig_14_01_path, bbox_inches="tight")
+                    fig.savefig(fig_14_01_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
                     display(SVG(filename=str(wc.figure_path(context, 18, "host_fraction_overview"))))
                     """
                 ),
@@ -3621,7 +4640,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     ax_var = fig.add_subplot(grid[0, 1])
                     ax_lrt = fig.add_subplot(grid[0, 2])
 
-                    plot_df = host_extended.copy().sort_values("estimate")
+                    plot_df = host_model_effects.copy().sort_values("estimate")
                     y = np.arange(plot_df.shape[0])
                     colors = np.where(plot_df["factor_family"] == "chronicity_group", "#bc4749", "#457b9d")
                     ax_forest.axvline(0, color="grey", linestyle="--", linewidth=1)
@@ -3630,16 +4649,16 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     ax_forest.set_yticks(y)
                     ax_forest.set_yticklabels(plot_df["term_label"])
                     ax_forest.set_xlabel("Coefficient on logit host-fraction scale")
-                    ax_forest.set_title("Fixed effects: host_extended")
+                    ax_forest.set_title("Fixed effects: host model")
 
-                    host_extended_status = host_status.loc[
+                    host_model_status = host_status.loc[
                         (host_status["record_type"] == "model_fit")
-                        & (host_status["model_name"] == "host_extended")
+                        & (host_status["model_name"] == advanced.HOST_MODEL_NAME)
                     ].iloc[0]
                     var_df = pd.DataFrame(
                         {
                             "component": ["Patient", "Batch"],
-                            "variance": [host_extended_status["patient_var"], host_extended_status["batch_var"]],
+                            "variance": [host_model_status["patient_var"], host_model_status["batch_var"]],
                         }
                     )
                     ax_var.hlines(var_df["component"], 0, var_df["variance"], color="#8d99ae", linewidth=2)
@@ -3651,7 +4670,7 @@ def build_notebooks(output_dir: Path) -> list[Path]:
 
                     lrt_df = host_status.loc[
                         (host_status["record_type"] == "random_effect_test")
-                        & (host_status["model_name"] == "host_extended")
+                        & (host_status["model_name"] == advanced.HOST_MODEL_NAME)
                     ].copy()
                     label_map = {
                         "patient_only_vs_fixed": "Patient vs fixed-only",
@@ -3671,7 +4690,9 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     ax_lrt.set_xlabel("-log10(boundary-corrected p)")
 
                     fig.tight_layout()
-                    fig.savefig(wc.figure_path(context, 19, "host_gaussian_mixed_summary"), bbox_inches="tight")
+                    fig_14_02_path = wc.figure_path(context, 19, "host_gaussian_mixed_summary")
+                    fig.savefig(fig_14_02_path, bbox_inches="tight")
+                    fig.savefig(fig_14_02_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
                     display(SVG(filename=str(wc.figure_path(context, 19, "host_gaussian_mixed_summary"))))
                     """
                 ),
@@ -3683,14 +4704,14 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                 code(
                     """
                     acute_q = float(
-                        host_extended.loc[
-                            host_extended["term"] == "C(chronicity_group, Treatment('unknown'))[T.acute_like]",
+                        host_model_effects.loc[
+                            host_model_effects["term"] == "C(chronicity_group, Treatment('unknown'))[T.acute_like]",
                             "posthoc_qvalue",
                         ].iloc[0]
                     )
                     upper_q = float(
-                        host_extended.loc[
-                            host_extended["term"] == "C(body_region, Treatment('lower_extremity'))[T.upper_extremity]",
+                        host_model_effects.loc[
+                            host_model_effects["term"] == "C(body_region, Treatment('lower_extremity'))[T.upper_extremity]",
                             "posthoc_qvalue",
                         ].iloc[0]
                     )
@@ -3744,7 +4765,9 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     axes[1].yaxis.set_major_formatter(PercentFormatter(1))
 
                     fig.tight_layout()
-                    fig.savefig(wc.figure_path(context, 20, "host_gaussian_followup"), bbox_inches="tight")
+                    fig_14_03_path = wc.figure_path(context, 20, "host_gaussian_followup")
+                    fig.savefig(fig_14_03_path, bbox_inches="tight")
+                    fig.savefig(fig_14_03_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
                     display(SVG(filename=str(wc.figure_path(context, 20, "host_gaussian_followup"))))
                     """
                 ),
@@ -3775,7 +4798,9 @@ def build_notebooks(output_dir: Path) -> list[Path]:
                     axes[1].set_ylabel("Batch")
 
                     fig.tight_layout()
-                    fig.savefig(wc.figure_path(context, 21, "host_gaussian_random_intercepts"), bbox_inches="tight")
+                    fig_14_04_path = wc.figure_path(context, 21, "host_gaussian_random_intercepts")
+                    fig.savefig(fig_14_04_path, bbox_inches="tight")
+                    fig.savefig(fig_14_04_path.with_suffix(".jpg"), bbox_inches="tight", dpi=300)
                     display(SVG(filename=str(wc.figure_path(context, 21, "host_gaussian_random_intercepts"))))
                     """
                 ),
@@ -3795,10 +4820,18 @@ def build_notebooks(output_dir: Path) -> list[Path]:
     ]
 
     notebook_paths: list[Path] = []
+    r_notebooks = {
+        "09_maaslin2_multivariable.ipynb",
+        "10_lefse_targeted_contrast.ipynb",
+        "11_host_fraction_beta_binomial.ipynb",
+        "12_adjusted_community_structure_analysis.ipynb",
+        "13_culture_threshold_and_concordance_analysis.ipynb",
+    }
+
     for name, cells in notebooks:
         nb = nbf.v4.new_notebook()
         nb["cells"] = cells
-        if name.startswith(("09_", "10_", "11_", "12_", "13_")):
+        if name in r_notebooks:
             nb["metadata"]["kernelspec"] = {
                 "display_name": "R (eb)",
                 "language": "R",

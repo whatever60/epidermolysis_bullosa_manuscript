@@ -4,17 +4,17 @@ from __future__ import annotations
 import argparse
 import math
 import re
+from collections import defaultdict
 from dataclasses import dataclass
+from glob import glob
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import statsmodels.formula.api as smf
-from matplotlib.ticker import PercentFormatter
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
 from statsmodels.stats.multitest import multipletests
 
 
@@ -301,6 +301,121 @@ def parse_seqkit_stats(path: Path) -> pd.DataFrame:
     return stats.set_index("sample_id").sort_index()
 
 
+def topological_sort(graph):
+    visited = set()
+    stack = []
+
+    def dfs(node):
+        visited.add(node)
+        for neighbor in graph.get(node, []):
+            if neighbor not in visited:
+                dfs(neighbor)
+        stack.append(node)
+
+    for node in graph:
+        if node not in visited:
+            dfs(node)
+
+    return stack[::-1]
+
+
+def rename_sample(name: str) -> str:
+    if name == "SUB2h1":
+        name = "SUB2k"
+    elif name == "SUB2h2":
+        name = "SUB2h"
+    elif name == "SUB7a1":
+        name = "SUB7a"
+    elif name == "SUB7a2":
+        name = "SUB6a"
+    elif name == "SUB18a1":
+        name = "SUB18a"
+    elif name == "SUB18a2":
+        name = "SUB19a"
+    elif name.startswith("yqebmeta"):
+        name = name.replace("yqebmeta", "SUB")
+
+    name = name.replace("SUB", "")
+    name = name.zfill(3).upper()
+    return name
+
+
+def parse_bracken_reports(
+    directory_path: str,
+    pattern: str = "_kraken_report_bracken_species.txt",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    # Faithful port of the original get_bracken_table.ipynb parser.
+    file_paths = glob(str(Path(directory_path) / f"*{pattern}"))
+
+    all_data: dict[str, dict[str, float]] = {}
+    all_reads: dict[str, dict[str, int]] = {}
+    taxonomy_records: dict[str, dict[str, str | None]] = {}
+    dups = defaultdict(int)
+    graph = defaultdict(list)
+
+    for file_path in file_paths:
+        filename = Path(file_path).name
+        sample_name = filename.split("_")[0]
+
+        df = pd.read_table(
+            file_path,
+            header=None,
+            names=["percentage", "reads", "reads_direct", "level", "taxid", "name"],
+            dtype={"name": str},
+        )
+
+        df["indent"] = df["name"].str.extract(r"^(\s*)")[0].str.len()
+        df["name"] = df["name"].str.lstrip()
+
+        sample_abund: dict[str, float] = {}
+        sample_reads: dict[str, int] = {}
+        lineage_stack: list[tuple[int, str, str]] = []
+
+        for _, row in df.iterrows():
+            taxon_name = row["name"]
+            level_code = row["level"]
+            indent = row["indent"]
+
+            while lineage_stack and lineage_stack[-1][0] >= indent:
+                lineage_stack.pop()
+            if lineage_stack:
+                src = lineage_stack[-1][2]
+                graph[src].append(level_code)
+
+            current_lineage: dict[str, str | None] = {}
+            for _, ancestor_name, ancestor_level in lineage_stack:
+                current_lineage[ancestor_level] = ancestor_name
+
+            current_lineage[level_code] = taxon_name
+            lineage_stack.append((indent, taxon_name, level_code))
+            if taxon_name not in taxonomy_records:
+                taxonomy_records[taxon_name] = current_lineage.copy()
+            else:
+                if taxonomy_records[taxon_name] != current_lineage:
+                    dups[taxon_name] += 1
+                    taxon_name = taxon_name + f".{dups[taxon_name]}"
+                    taxonomy_records[taxon_name] = current_lineage.copy()
+
+            sample_abund[taxon_name] = row["percentage"]
+            sample_reads[taxon_name] = row["reads"]
+
+        all_data[sample_name] = sample_abund
+        all_reads[sample_name] = sample_reads
+
+    abundance_df = pd.DataFrame.from_dict(all_data, orient="index").fillna(0)
+    read_count_df = pd.DataFrame.from_dict(all_reads, orient="index").fillna(0)
+    cols = topological_sort(graph)
+    tax_df = pd.DataFrame.from_dict(taxonomy_records, orient="index", columns=cols)
+    return abundance_df, read_count_df, tax_df
+
+
+def load_bracken_with_host_counts(context: AnalysisContext) -> pd.DataFrame:
+    _, read_count_df, _ = parse_bracken_reports(str(context.data_dir / "kraken_with_host"))
+    read_count_df.index = read_count_df.index.map(rename_sample)
+    read_count_df = read_count_df.groupby(level=0).sum().sort_index()
+    return read_count_df
+
+
 def load_bracken_tables(context: AnalysisContext) -> tuple[pd.DataFrame, pd.DataFrame]:
     species_all = pd.read_csv(context.data_dir / "read_count_species_all.csv", index_col=0)
     species_bac = pd.read_csv(context.data_dir / "read_count_species_bac.csv", index_col=0)
@@ -309,6 +424,36 @@ def load_bracken_tables(context: AnalysisContext) -> tuple[pd.DataFrame, pd.Data
     species_all = species_all.groupby(level=0).sum().sort_index()
     species_bac = species_bac.groupby(level=0).sum().sort_index()
     return species_all, species_bac
+
+
+def load_kraken_unclassified_counts(context: AnalysisContext, report_subdir: str = "kraken_with_host") -> pd.Series:
+    report_dir = context.data_dir / report_subdir
+    values: dict[str, int] = {}
+    for report_path in sorted(report_dir.glob("*_kraken_report.txt")):
+        sample_stub = report_path.name[: -len("_kraken_report.txt")]
+        sample_id = normalize_sample_id(sample_stub)
+        unclassified_reads: int | None = None
+        with report_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                parts = raw_line.rstrip("\n").split("\t")
+                if len(parts) < 6:
+                    continue
+                rank_code = parts[3].strip()
+                taxid = parts[4].strip()
+                name = parts[5].strip().lower()
+                if rank_code == "U" and taxid == "0" and name == "unclassified":
+                    try:
+                        unclassified_reads = int(float(parts[1]))
+                    except ValueError:
+                        unclassified_reads = 0
+                    break
+        values[sample_id] = 0 if unclassified_reads is None else unclassified_reads
+
+    if not values:
+        return pd.Series(dtype=float, name="kraken_unclassified_reads")
+
+    series = pd.Series(values, name="kraken_unclassified_reads").groupby(level=0).sum().sort_index()
+    return series
 
 
 def load_metaphlan_table(context: AnalysisContext) -> pd.DataFrame:
@@ -467,14 +612,38 @@ def prepare_qc_table(
     qc = qc.join(no_host_stats[["non_host_pairs"]], how="left")
 
     qc["trimmed_fraction"] = qc["trimmed_pairs"] / qc["raw_pairs"]
-    qc["host_removed_fraction"] = 1 - (qc["non_host_pairs"] / qc["trimmed_pairs"])
+    qc["host_alignment_fraction"] = 1 - (qc["non_host_pairs"] / qc["trimmed_pairs"])
 
+    with_host_counts = load_bracken_with_host_counts(context).reindex(qc.index).fillna(0)
     qc["classified_species_reads"] = species_all.sum(axis=1)
+    qc["bracken_root_reads"] = with_host_counts.get("root", pd.Series(0, index=with_host_counts.index)).astype(float)
+    qc["human_species_reads"] = with_host_counts.get("Homo sapiens", pd.Series(0, index=with_host_counts.index)).astype(float)
+    qc["bracken_total_reads"] = qc["bracken_root_reads"]
+    kraken_unclassified = load_kraken_unclassified_counts(context, report_subdir="kraken_with_host").reindex(qc.index).fillna(0)
+    qc["kraken_unclassified_reads"] = kraken_unclassified.astype(float)
     qc["bacterial_species_reads"] = species_bac.sum(axis=1)
-    qc["human_species_reads"] = species_all.get("Homo sapiens", pd.Series(0, index=species_all.index))
+    qc["non_human_species_reads"] = (qc["bracken_total_reads"] - qc["human_species_reads"]).clip(lower=0)
+    qc["non_bacterial_non_human_reads"] = (
+        qc["bracken_total_reads"] - qc["human_species_reads"] - qc["bacterial_species_reads"]
+    ).clip(lower=0)
     qc["bacterial_richness"] = (species_bac > 0).sum(axis=1)
-    qc["human_species_fraction"] = qc["human_species_reads"] / qc["classified_species_reads"]
-    qc["bacterial_species_fraction"] = qc["bacterial_species_reads"] / qc["classified_species_reads"]
+    qc["human_species_fraction"] = np.where(
+        qc["bracken_total_reads"] > 0,
+        qc["human_species_reads"] / qc["bracken_total_reads"],
+        np.nan,
+    )
+    qc["bacterial_species_fraction"] = np.where(
+        qc["bracken_total_reads"] > 0,
+        qc["bacterial_species_reads"] / qc["bracken_total_reads"],
+        np.nan,
+    )
+    qc["non_bacterial_non_human_fraction"] = np.where(
+        qc["bracken_total_reads"] > 0,
+        qc["non_bacterial_non_human_reads"] / qc["bracken_total_reads"],
+        np.nan,
+    )
+    # Primary host-burden definition uses pre-host-filter Bracken root composition.
+    qc["host_removed_fraction"] = qc["human_species_fraction"]
 
     metaphlan_species_cols = [column for column in metaphlan.columns if "|s__" in column and column.count("|") >= 6]
     qc["metaphlan_species_reads"] = metaphlan[metaphlan_species_cols].sum(axis=1)
@@ -545,68 +714,6 @@ def fit_host_model(qc: pd.DataFrame) -> tuple[object, pd.DataFrame]:
     return fit, bh_adjust(results, "pvalue")
 
 
-def make_qc_figure(qc: pd.DataFrame, context: AnalysisContext) -> None:
-    plot_df = qc.copy()
-    plot_df["body_region_label"] = plot_df["body_region"].map(BODY_REGION_LABELS)
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    sns.scatterplot(
-        data=plot_df,
-        x="non_host_pairs",
-        y="bacterial_species_reads",
-        hue="host_removed_fraction",
-        palette="viridis",
-        ax=axes[0],
-        s=70,
-    )
-    axes[0].axhline(10_000, color="firebrick", linestyle="--", linewidth=1)
-    axes[0].set_xscale("log")
-    axes[0].set_yscale("log")
-    axes[0].set_xlabel("Host-depleted read pairs")
-    axes[0].set_ylabel("Bracken bacterial species reads")
-    axes[0].set_title("QC overview")
-    legend = axes[0].legend(loc="lower right", title="Host removed")
-    if legend is not None:
-        for text in legend.get_texts():
-            try:
-                text.set_text(f"{float(text.get_text()):.2f}")
-            except ValueError:
-                pass
-
-    order = [region for region in BODY_REGION_ORDER if region in plot_df["body_region"].unique()]
-    sns.boxplot(
-        data=plot_df,
-        x="body_region",
-        y="host_removed_fraction",
-        order=order,
-        color="#d7e3f4",
-        width=0.6,
-        ax=axes[1],
-        fliersize=0,
-    )
-    sns.stripplot(
-        data=plot_df,
-        x="body_region",
-        y="host_removed_fraction",
-        order=order,
-        hue="patient_id",
-        dodge=False,
-        size=6,
-        ax=axes[1],
-    )
-    axes[1].yaxis.set_major_formatter(PercentFormatter(1.0))
-    axes[1].set_xlabel("Body region")
-    axes[1].set_ylabel("Alignment-based host fraction")
-    axes[1].set_title("Host burden by body region")
-    axes[1].set_xticks(range(len(order)), [BODY_REGION_LABELS[item] for item in order], rotation=20, ha="right")
-    axes[1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5), title="Patient", frameon=False)
-
-    fig.tight_layout()
-    fig.savefig(context.figure_dir / "fig_02_01_qc_host_burden.svg", bbox_inches="tight")
-    plt.close(fig)
-
-
 def community_relative_abundance(species_bac: pd.DataFrame, sample_ids: list[str]) -> pd.DataFrame:
     subset = species_bac.loc[sample_ids].copy()
     subset = subset.loc[:, subset.sum(axis=0) > 0]
@@ -643,7 +750,7 @@ def summarize_pairwise_distances(rel_abundance: pd.DataFrame, metadata: pd.DataF
     return pd.DataFrame(rows)
 
 
-def make_distance_figure(pairwise: pd.DataFrame, context: AnalysisContext) -> pd.DataFrame:
+def summarize_pairwise_distance_groups(pairwise: pd.DataFrame) -> pd.DataFrame:
     order = [
         "Same patient, same batch date",
         "Same patient, different batch date",
@@ -671,46 +778,6 @@ def make_distance_figure(pairwise: pd.DataFrame, context: AnalysisContext) -> pd
         )
     pvalues = bh_adjust(pd.DataFrame(pvalue_rows), "pvalue")
 
-    fig, ax = plt.subplots(figsize=(8.5, 5))
-    sns.boxplot(
-        data=pairwise,
-        x="comparison_group",
-        y="distance",
-        order=order,
-        color="#dfe7d6",
-        fliersize=0,
-        width=0.6,
-        ax=ax,
-    )
-    sns.stripplot(
-        data=pairwise.sample(min(pairwise.shape[0], 4000), random_state=7),
-        x="comparison_group",
-        y="distance",
-        order=order,
-        color="#3f4d3c",
-        alpha=0.25,
-        size=3,
-        ax=ax,
-    )
-    ax.set_xlabel("")
-    ax.set_ylabel("Bray-Curtis distance")
-    ax.set_title("Descriptive Bray-Curtis similarity by patient and batch-date grouping")
-    ax.set_xticks(range(len(order)), order, rotation=15, ha="right")
-
-    for idx, row in pvalues.iterrows():
-        ax.text(
-            idx,
-            0.98,
-            f"q={row['qvalue']:.3g}",
-            ha="center",
-            va="top",
-            fontsize=9,
-        )
-
-    fig.tight_layout()
-    fig.savefig(context.figure_dir / "fig_03_01_pairwise_distance.svg", bbox_inches="tight")
-    plt.close(fig)
-
     return summary.merge(pvalues, on="comparison_group", how="left")
 
 
@@ -735,7 +802,8 @@ def make_culture_abundance_table(
         positive_values = feature.loc[positive_mask]
         negative_values = feature.loc[negative_mask]
         test = mannwhitneyu(positive_values, negative_values, alternative="greater")
-        auc = test.statistic / (len(positive_values) * len(negative_values))
+        y_true = positive_mask.astype(int)
+        auc = roc_auc_score(y_true, feature)
 
         detection_positive = (positive_values >= 0.01).mean()
         detection_negative = (negative_values >= 0.01).mean()
@@ -771,51 +839,6 @@ def make_culture_abundance_table(
     summary = bh_adjust(pd.DataFrame(rows).sort_values(["n_culture_positive", "auroc"], ascending=[False, False]), "pvalue")
     plot_df = pd.DataFrame(plot_rows)
     return summary, plot_df
-
-
-def make_culture_figure(summary: pd.DataFrame, plot_df: pd.DataFrame, context: AnalysisContext) -> None:
-    top_labels = summary.head(6)["label"].tolist()
-    plot_df = plot_df.loc[plot_df["label"].isin(top_labels)].copy()
-    plot_df["culture_status"] = np.where(plot_df["culture_positive"], "Culture positive", "Culture negative")
-    plot_df["log10_relative_abundance"] = np.log10(plot_df["relative_abundance"] + 1e-6)
-
-    fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharey=True)
-    axes = axes.ravel()
-
-    for ax, label in zip(axes, top_labels):
-        data = plot_df.loc[plot_df["label"] == label]
-        sns.boxplot(
-            data=data,
-            x="culture_status",
-            y="log10_relative_abundance",
-            color="#f2d4b7",
-            width=0.6,
-            fliersize=0,
-            ax=ax,
-        )
-        sns.stripplot(
-            data=data,
-            x="culture_status",
-            y="log10_relative_abundance",
-            color="#5b3417",
-            alpha=0.5,
-            size=4,
-            ax=ax,
-        )
-        metrics = summary.loc[summary["label"] == label].iloc[0]
-        ax.set_title(
-            f"{label}\nU-test q={metrics['qvalue']:.3g}; AUROC={metrics['auroc']:.2f}"
-        )
-        ax.set_xlabel("")
-        ax.set_ylabel("log10(relative abundance + 1e-6)")
-        ax.tick_params(axis="x", rotation=20)
-
-    for ax in axes[len(top_labels):]:
-        ax.axis("off")
-
-    fig.tight_layout()
-    fig.savefig(context.figure_dir / "fig_04_01_culture_concordance.svg", bbox_inches="tight")
-    plt.close(fig)
 
 
 def clr_transform(counts: pd.DataFrame, pseudocount: float = 0.5) -> pd.DataFrame:
@@ -888,7 +911,7 @@ def prettify_model_term(term: str) -> str:
     return replacements.get(term, term)
 
 
-def make_species_association_figure(results: pd.DataFrame, context: AnalysisContext) -> pd.DataFrame:
+def prepare_species_association_plot_df(results: pd.DataFrame) -> pd.DataFrame:
     if results.empty:
         return results
 
@@ -905,29 +928,6 @@ def make_species_association_figure(results: pd.DataFrame, context: AnalysisCont
     plot_df["species_label"] = plot_df["species"]
     plot_df = plot_df.sort_values(["estimate", "species_label"])
     plot_df["y_label"] = plot_df["species_label"] + " | " + plot_df["term_label"]
-
-    fig, ax = plt.subplots(figsize=(10, max(4.5, 0.45 * plot_df.shape[0])))
-    ax.axvline(0, color="black", linewidth=1, linestyle="--")
-    ax.errorbar(
-        x=plot_df["estimate"],
-        y=np.arange(plot_df.shape[0]),
-        xerr=[
-            plot_df["estimate"] - plot_df["conf_low"],
-            plot_df["conf_high"] - plot_df["estimate"],
-        ],
-        fmt="o",
-        color="#204a87",
-        ecolor="#7aa6d8",
-        capsize=3,
-    )
-    ax.set_yticks(np.arange(plot_df.shape[0]))
-    ax.set_yticklabels(plot_df["y_label"])
-    ax.set_xlabel("Cluster-robust CLR effect size")
-    ax.set_ylabel("")
-    ax.set_title("Body region and chronicity associations for key taxa")
-    fig.tight_layout()
-    fig.savefig(context.figure_dir / "fig_05_01_species_associations.svg", bbox_inches="tight")
-    plt.close(fig)
 
     return plot_df
 
@@ -962,13 +962,13 @@ def write_report(
         "",
         "- Primary metadata source: `PA_Data_Finalized.xlsx`, sheet `Corrected EB wound spreadsheet`.",
         "- Taxonomic source for bacterial community analysis: Bracken bacterial species counts.",
-        "- Host burden source: alignment-based host depletion from `fastp.stats` and `fastp_no_host.stats`, with Bracken human reads used as a cross-check.",
+        "- Host burden source: Bracken human species fraction among Bracken root reads from pre-host-filter sequencing data.",
         "- Absolute culture date is treated as technical batch; patient-relative elapsed time is treated as the biological time variable.",
         f"- Community-level analyses used a depth-aware QC threshold of at least 10,000 Bracken bacterial reads ({qc_samples} / {qc.shape[0]} samples passed; {low_depth} were retained for descriptive analyses only).",
         "",
         "## Key findings",
         "",
-        f"- Host contamination was substantial: median alignment-based host fraction was {qc['host_removed_fraction'].median():.1%}, and median Bracken bacterial fraction among classified species reads was {qc['bacterial_species_fraction'].median():.1%}.",
+        f"- Host contamination was substantial: median Bracken-based human fraction was {qc['host_removed_fraction'].median():.1%}, median Bracken bacterial fraction among root reads was {qc['bacterial_species_fraction'].median():.1%}, and median non-bacterial/non-human residual fraction was {qc['non_bacterial_non_human_fraction'].median():.2%}.",
         f"- Revisit structure is real, not negligible: the 74 swabs came from {qc['patient_id'].nunique()} patients across {qc['culture_date'].dt.strftime('%Y-%m-%d').nunique()} collection dates spanning {qc['culture_date'].min().date()} to {qc['culture_date'].max().date()}, and {revisit_patients} of the {qc['patient_id'].nunique()} patients had samples on more than one date.",
     ]
 
@@ -1004,7 +1004,7 @@ def write_report(
             "",
             "## Figure captions",
             "",
-            "1. `fig_02_01_qc_host_burden.svg`: QC overview. Left, host-depleted read pairs versus Bracken bacterial species reads, with the community-analysis threshold at 10,000 reads. Right, alignment-based host fraction by body region; points are individual swabs colored by patient.",
+            "1. `fig_02_01_qc_host_burden.svg`: QC overview. Left, host-depleted read pairs versus Bracken bacterial species reads, with the community-analysis threshold at 10,000 reads. Right, Bracken human fraction by body region; points are individual swabs colored by patient.",
             "2. `fig_03_01_pairwise_distance.svg`: Pairwise Bray-Curtis distances between QC-passing swabs. Same-patient, same-batch-date comparisons are the closest descriptive group; same-patient different-batch-date comparisons are shown separately because absolute date is treated as technical batch in later models.",
             "3. `fig_04_01_culture_concordance.svg`: Metagenomic relative abundance of key pathogen groups stratified by whether routine culture called the same organism group. Boxplots summarize distributions; point clouds show individual swabs.",
             "4. `fig_05_01_species_associations.svg`: Cluster-robust CLR effect sizes for selected taxa versus body region and chronicity covariates after adjusting for sequencing depth.",
@@ -1065,10 +1065,6 @@ def main() -> None:
     )
     ensure_output_dirs(context)
 
-    sns.set_theme(style="whitegrid", context="talk")
-    plt.rcParams["svg.fonttype"] = "none"
-    plt.rcParams["pdf.fonttype"] = 42
-
     species_all, species_bac = load_bracken_tables(context)
     metaphlan = load_metaphlan_table(context)
     sample_ids = sorted(species_all.index)
@@ -1076,18 +1072,16 @@ def main() -> None:
     qc = prepare_qc_table(context, metadata, species_all, species_bac, metaphlan)
 
     host_fit, host_results = fit_host_model(qc)
-    make_qc_figure(qc, context)
 
     community_samples = qc.index[qc["community_qc_pass"]].tolist()
     rel_abundance = community_relative_abundance(species_bac, community_samples)
     pairwise = summarize_pairwise_distances(rel_abundance, metadata)
-    pairwise_summary = make_distance_figure(pairwise, context)
+    pairwise_summary = summarize_pairwise_distance_groups(pairwise)
 
-    culture_summary, culture_plot_df = make_culture_abundance_table(qc, species_bac)
-    make_culture_figure(culture_summary, culture_plot_df, context)
+    culture_summary, _ = make_culture_abundance_table(qc, species_bac)
 
     species_results = fit_species_models(qc, species_bac)
-    species_plot_df = make_species_association_figure(species_results, context)
+    species_plot_df = prepare_species_association_plot_df(species_results)
 
     metadata.to_csv(context.table_dir / "cleaned_metadata.tsv", sep="\t")
     qc.to_csv(context.table_dir / "qc_metrics.tsv", sep="\t")
